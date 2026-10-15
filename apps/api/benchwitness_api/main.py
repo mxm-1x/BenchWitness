@@ -3,13 +3,17 @@
 from functools import lru_cache
 from typing import Annotated, Literal
 
+from benchwitness_ml.runner import DemoEvaluationRunner, EvaluationBlocked
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from benchwitness_api.demo_seed import DemoSeedService, artifact_directory_from_env
 from benchwitness_api.graph import GraphProbe, GraphUnavailable
-from benchwitness_api.graph_lineage import GraphLineageStore, LineageGraphError
+from benchwitness_api.graph_lineage import (
+    GraphLineageStore,
+    LineageGraphError,
+)
 from benchwitness_api.settings import GraphSettings
 
 
@@ -56,6 +60,34 @@ class LineageAuditResponse(BaseModel):
     evidence: list[LineageEvidenceResponse]
 
 
+class ExperimentRunResponse(BaseModel):
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    model_id: str
+    model_config_json: str
+    created_at: str
+    python_version: str
+    training_sample_count: int
+    evaluation_sample_count: int
+    accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    true_positive: int
+    false_positive: int
+    true_negative: int
+    false_negative: int
+    prediction_sha256: str
+    manifest_sha256: str
+    artifact_path: str
+
+
+class DemoEvaluationResponse(BaseModel):
+    runs: list[ExperimentRunResponse]
+
+
 @lru_cache(maxsize=1)
 def get_graph_probe() -> GraphProbe:
     return GraphProbe(GraphSettings.from_env())
@@ -69,6 +101,11 @@ def get_graph_lineage_store() -> GraphLineageStore:
 @lru_cache(maxsize=1)
 def get_demo_seed_service() -> DemoSeedService:
     return DemoSeedService(get_graph_lineage_store(), artifact_directory_from_env())
+
+
+@lru_cache(maxsize=1)
+def get_demo_evaluation_runner() -> DemoEvaluationRunner:
+    return DemoEvaluationRunner(get_graph_lineage_store(), artifact_directory_from_env())
 
 
 app = FastAPI(title="BenchWitness API", version="0.1.0")
@@ -135,3 +172,22 @@ def audit_experiment_lineage(
         source_artifact_verified=result.source_artifact_verified,
         evidence=[LineageEvidenceResponse(**evidence.__dict__) for evidence in result.evidence],
     )
+
+
+@app.post("/api/v1/demo/evaluate", response_model=DemoEvaluationResponse)
+def evaluate_demo(
+    runner: Annotated[DemoEvaluationRunner, Depends(get_demo_evaluation_runner)],
+) -> DemoEvaluationResponse | JSONResponse:
+    try:
+        runs = runner.run_all()
+    except EvaluationBlocked as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "evaluation_blocked", "message": str(exc)},
+        )
+    except LineageGraphError:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "graph_unavailable", "message": "FalkorDB evaluation failed"},
+        )
+    return DemoEvaluationResponse(runs=[ExperimentRunResponse(**run.__dict__) for run in runs])

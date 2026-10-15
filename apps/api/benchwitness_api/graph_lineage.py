@@ -20,6 +20,7 @@ from benchwitness_api.settings import GraphSettings
 _QUERY_TIMEOUT_MS = 5_000
 _WRITE_BATCH_SIZE = 200
 _MAX_EVIDENCE_PATHS = 100
+_MAX_DATASET_SAMPLES = 1_000
 
 _UPSERT_SOURCES = """
 UNWIND $rows AS row
@@ -97,6 +98,12 @@ _GET_SOURCE_RECORDS = """
 MATCH (source:SourceRecord {family_id: $family_id})
 RETURN count(source), collect(source.id)
 """
+_RESOLVE_DATASET_SAMPLES = """
+MATCH (dataset:DatasetVersion {id: $dataset_id})-[:CONTAINS]->(sample:SampleVersion)
+OPTIONAL MATCH (sample)-[:DERIVED_FROM*1..3]->(source:SourceRecord)
+RETURN sample.id, collect(DISTINCT source.id)
+LIMIT $limit
+"""
 _COUNT_UNTRACED_SAMPLES = """
 MATCH (dataset:DatasetVersion {id: $dataset_id})
 OPTIONAL MATCH (dataset)-[:CONTAINS]->(sample:SampleVersion)
@@ -116,6 +123,52 @@ WHERE source.id = evaluation_source.id
 RETURN source.id, training.id, training_sample.id, length(training_path),
        evaluation.id, evaluation_sample.id, length(evaluation_path)
 LIMIT $limit
+"""
+_RECORD_RUN = """
+MERGE (run:ExperimentRun {id: $run_id})
+ON CREATE SET run.experiment_id = $experiment_id,
+    run.training_dataset_id = $training_dataset_id,
+    run.evaluation_dataset_id = $evaluation_dataset_id,
+    run.model_id = $model_id,
+    run.model_config = $model_config,
+    run.created_at = $created_at,
+    run.python_version = $python_version,
+    run.training_sample_count = $training_sample_count,
+    run.evaluation_sample_count = $evaluation_sample_count,
+    run.accuracy = $accuracy,
+    run.precision = $precision,
+    run.recall = $recall,
+    run.f1 = $f1,
+    run.true_positive = $true_positive,
+    run.false_positive = $false_positive,
+    run.true_negative = $true_negative,
+    run.false_negative = $false_negative,
+    run.prediction_sha256 = $prediction_sha256,
+    run.manifest_sha256 = $manifest_sha256,
+    run.artifact_path = $artifact_path
+WITH run
+MATCH (experiment:Experiment {id: $experiment_id})
+MATCH (training:DatasetVersion {id: $training_dataset_id})
+MATCH (evaluation:DatasetVersion {id: $evaluation_dataset_id})
+WHERE run.experiment_id = $experiment_id
+  AND run.training_dataset_id = $training_dataset_id
+  AND run.evaluation_dataset_id = $evaluation_dataset_id
+MERGE (experiment)-[:HAS_RUN]->(run)
+MERGE (run)-[:TRAINED_ON]->(training)
+MERGE (run)-[:EVALUATED_ON]->(evaluation)
+RETURN run.id
+"""
+_GET_RUN = """
+MATCH (experiment:Experiment)-[:HAS_RUN]->(run:ExperimentRun {id: $run_id})
+MATCH (run)-[:TRAINED_ON]->(training:DatasetVersion)
+MATCH (run)-[:EVALUATED_ON]->(evaluation:DatasetVersion)
+RETURN run.id, experiment.id, training.id, evaluation.id, run.model_id,
+       run.model_config, run.created_at, run.python_version,
+       run.training_sample_count, run.evaluation_sample_count,
+       run.accuracy, run.precision, run.recall, run.f1,
+       run.true_positive, run.false_positive, run.true_negative, run.false_negative,
+       run.prediction_sha256, run.manifest_sha256, run.artifact_path
+LIMIT 1
 """
 
 
@@ -147,6 +200,46 @@ class AuditResult:
     evaluation_manifest_verified: bool
     source_artifact_verified: bool
     evidence: tuple[AuditEvidence, ...]
+
+
+@dataclass(frozen=True)
+class ResolvedSample:
+    sample_id: str
+    source_record_id: str
+
+
+@dataclass(frozen=True)
+class ResolvedDataset:
+    dataset_id: str
+    role: str
+    source_manifest_hash: str
+    source_record_count: int
+    samples: tuple[ResolvedSample, ...]
+
+
+@dataclass(frozen=True)
+class ExperimentRunRecord:
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    model_id: str
+    model_config_json: str
+    created_at: str
+    python_version: str
+    training_sample_count: int
+    evaluation_sample_count: int
+    accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    true_positive: int
+    false_positive: int
+    true_negative: int
+    false_negative: int
+    prediction_sha256: str
+    manifest_sha256: str
+    artifact_path: str
 
 
 class GraphLineageStore:
@@ -240,8 +333,8 @@ class GraphLineageStore:
             training_manifest_verified = training_verification[0]
             evaluation_manifest_verified = evaluation_verification[0]
             source_artifact_verified = (
-                self._verify_source_artifact(training_verification[1:])
-                and training_verification[1:] == evaluation_verification[1:]
+                self._verify_source_artifact(training_verification[2:5])
+                and training_verification[2:5] == evaluation_verification[2:5]
             )
             training_untraced = self._count_untraced(training_dataset_id)
             evaluation_untraced = self._count_untraced(evaluation_dataset_id)
@@ -299,7 +392,7 @@ class GraphLineageStore:
             evidence=evidence,
         )
 
-    def _verify_dataset_manifest(self, dataset_id: str) -> tuple[bool, str, str, int]:
+    def _verify_dataset_manifest(self, dataset_id: str) -> tuple[bool, str, str, str, int, int]:
         rows = self._query(_GET_DATASET_MANIFEST, {"dataset_id": dataset_id})
         if len(rows) != 1 or len(rows[0]) != 9:
             raise LineageGraphError("FalkorDB returned invalid dataset manifest data")
@@ -317,7 +410,14 @@ class GraphLineageStore:
         sample_ids = tuple(sorted(str(sample_id) for sample_id in raw_sample_ids))
         calculated_digest = dataset_manifest_digest(dataset_id, role, sample_ids, lineage_complete)
         if declared_count != len(sample_ids) or calculated_digest != graph_digest:
-            return False, source_family_id, source_manifest_hash, source_record_count
+            return (
+                False,
+                role,
+                source_family_id,
+                source_manifest_hash,
+                source_record_count,
+                declared_count,
+            )
 
         safe_name = dataset_id.removeprefix("dataset:").replace(":", "_")
         manifest_path = self._artifact_dir / "manifests" / f"{safe_name}.json"
@@ -336,7 +436,14 @@ class GraphLineageStore:
             )
         except (OSError, ValueError, TypeError, KeyError):
             manifest_verified = False
-        return manifest_verified, source_family_id, source_manifest_hash, source_record_count
+        return (
+            manifest_verified,
+            role,
+            source_family_id,
+            source_manifest_hash,
+            source_record_count,
+            declared_count,
+        )
 
     def _verify_source_artifact(self, metadata: tuple[str, str, int]) -> bool:
         family_id, expected_digest, expected_count = metadata
@@ -364,6 +471,84 @@ class GraphLineageStore:
             and len(set(source_ids)) == len(source_ids)
             and sorted(source_ids) == graph_ids
             and artifact_digest == expected_digest
+        )
+
+    def resolve_dataset(
+        self, dataset_id: str, expected_role: Literal["training", "evaluation"]
+    ) -> ResolvedDataset:
+        """Resolve graph memberships to canonical rows after verifying their artifacts."""
+        verification = self._verify_dataset_manifest(dataset_id)
+        if not verification[0] or verification[1] != expected_role:
+            raise LineageGraphError("dataset manifest or role is not verified")
+        if not self._verify_source_artifact(verification[2:5]):
+            raise LineageGraphError("source artifact does not match graph lineage")
+
+        rows = self._query(
+            _RESOLVE_DATASET_SAMPLES,
+            {"dataset_id": dataset_id, "limit": _MAX_DATASET_SAMPLES + 1},
+        )
+        if len(rows) > _MAX_DATASET_SAMPLES or len(rows) != verification[5]:
+            raise LineageGraphError("dataset sample count exceeds the verified manifest")
+
+        resolved: list[ResolvedSample] = []
+        seen_sample_ids: set[str] = set()
+        for row in rows:
+            if len(row) != 2:
+                raise LineageGraphError("FalkorDB returned invalid sample lineage data")
+            sample_id = str(row[0])
+            raw_source_ids = row[1] or []
+            if not isinstance(raw_source_ids, list) or len(raw_source_ids) != 1:
+                raise LineageGraphError("dataset contains a sample without one canonical source")
+            if sample_id in seen_sample_ids:
+                raise LineageGraphError("FalkorDB returned duplicate dataset membership")
+            seen_sample_ids.add(sample_id)
+            resolved.append(ResolvedSample(sample_id, str(raw_source_ids[0])))
+        return ResolvedDataset(
+            dataset_id=dataset_id,
+            role=expected_role,
+            source_manifest_hash=verification[3],
+            source_record_count=verification[4],
+            samples=tuple(sorted(resolved, key=lambda sample: sample.sample_id)),
+        )
+
+    def record_run(self, record: ExperimentRunRecord) -> None:
+        """Append a measured run and its exact dataset edges to the graph."""
+        params = record.__dict__.copy()
+        params["model_config"] = params.pop("model_config_json")
+        rows = self._query(_RECORD_RUN, params)
+        if rows != [[record.run_id]]:
+            raise LineageGraphError("FalkorDB did not persist the experiment run and dataset edges")
+
+    def get_run(self, run_id: str) -> ExperimentRunRecord:
+        """Read a persisted experiment run through a fixed query template."""
+        rows = self._query(_GET_RUN, {"run_id": run_id})
+        if not rows:
+            raise KeyError(run_id)
+        row = rows[0]
+        if len(row) != 21:
+            raise LineageGraphError("FalkorDB returned invalid experiment run data")
+        return ExperimentRunRecord(
+            run_id=str(row[0]),
+            experiment_id=str(row[1]),
+            training_dataset_id=str(row[2]),
+            evaluation_dataset_id=str(row[3]),
+            model_id=str(row[4]),
+            model_config_json=str(row[5]),
+            created_at=str(row[6]),
+            python_version=str(row[7]),
+            training_sample_count=int(row[8]),
+            evaluation_sample_count=int(row[9]),
+            accuracy=float(row[10]),
+            precision=float(row[11]),
+            recall=float(row[12]),
+            f1=float(row[13]),
+            true_positive=int(row[14]),
+            false_positive=int(row[15]),
+            true_negative=int(row[16]),
+            false_negative=int(row[17]),
+            prediction_sha256=str(row[18]),
+            manifest_sha256=str(row[19]),
+            artifact_path=str(row[20]),
         )
 
     def _count_untraced(self, dataset_id: str) -> int:

@@ -1,6 +1,6 @@
 # BenchWitness — dataset inventory and sourcing notes
 
-**Status:** Milestone 2 implementation. The committed generator creates a 400-row synthetic source with seed `20261015`, stable canonical IDs, a disjoint 300/100 stratified split, five versioned manifests, and four lineage experiments. Rows and manifests are generated locally by `uv run benchwitness-seed-demo`; generated artifacts remain ignored by Git. This milestone contains no trained models or evaluation metrics.
+**Status:** Milestone 3 implementation. The generator creates a 400-row synthetic source with seed `20261015`, stable canonical IDs, a disjoint 300/100 stratified split, five versioned manifests, and four lineage experiments. The CPU runner consumes graph-resolved memberships for the two confirmed-overlap experiments and clean control, calculates actual predictions and metrics, and writes immutable per-run artifacts. Generated files remain ignored by Git.
 
 ## Finding: one source dataset is enough
 
@@ -48,4 +48,4 @@ Avoid tuning algorithms, feature transforms, copied-ID selection, or hyperparame
 - Original and repaired metrics are generated from real predictions; no expected score or job success is inserted as fixture data.
 - Generated or optional public data comply with the event rules; no private, login-protected, personal, or restricted dataset enters the graph.
 
-The seed command creates the rows and manifests reproducibly. The real-FalkorDB integration test verifies two confirmed paths for the shared leaked source, a clean same-family control, missing ancestry as `unknown`, and manifest drift preventing a complete clean result. Training and measured scores remain Milestone 3 work.
+The seed command creates the rows and manifests reproducibly. The real-FalkorDB integration test verifies two confirmed paths for the shared leaked source, a clean same-family control, missing ancestry as `unknown`, manifest drift preventing a complete clean result, and three persisted experiment runs with metrics independently recomputed from checksummed predictions. No direction or size of score change is promised. Impact propagation and approved recovery remain later milestones.
