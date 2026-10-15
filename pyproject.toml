@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
   "falkordb>=1.0,<3",
   "fastapi>=0.115,<1",
+  "rq>=2.6,<3",
   "uvicorn>=0.30,<1",
 ]
 
@@ -13,6 +14,7 @@ dependencies = [
 benchwitness-graph-health = "benchwitness_api.cli:main"
 benchwitness-seed-demo = "benchwitness_api.seed_cli:main"
 benchwitness-run-demo = "benchwitness_ml.cli:main"
+benchwitness-worker = "benchwitness_ml.recovery_worker:main"
 
 [build-system]
 requires = ["hatchling>=1.25,<2"]

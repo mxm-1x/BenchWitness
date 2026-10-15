@@ -128,6 +128,74 @@ class DemoEvaluationRunner:
             runs.append(self._graph.get_run(run.run_id))
         return runs
 
+    def run_recovery(self, original_run_id: str, job_id: str) -> tuple[ExperimentRunRecord, str]:
+        """Refit 1-NN on the verified intended split and measure the held-out set."""
+        original = self._graph.get_run(original_run_id)
+        if original.model_id != _MODEL_ID or original.model_config_json != json.dumps(
+            _MODEL_CONFIG, sort_keys=True, separators=(",", ":")
+        ):
+            raise EvaluationBlocked("original model configuration is unsupported for recovery")
+        contaminated_audit = self._graph.audit(original.experiment_id)
+        if (
+            contaminated_audit.status != "confirmed"
+            or not contaminated_audit.coverage_complete
+            or original.training_dataset_id != contaminated_audit.training_dataset_id
+            or original.evaluation_dataset_id != contaminated_audit.evaluation_dataset_id
+        ):
+            raise EvaluationBlocked("original run does not have verified contaminated lineage")
+        clean = self._graph.resolve_dataset("dataset:train-clean-control-v1", "training")
+        evaluation = self._graph.resolve_dataset(original.evaluation_dataset_id, "evaluation")
+        split_path = self._artifact_dir / "split_manifest.json"
+        try:
+            split = json.loads(split_path.read_text(encoding="utf-8"))
+            train_ids = {sample.source_record_id for sample in clean.samples}
+            eval_ids = {sample.source_record_id for sample in evaluation.samples}
+            if (
+                sorted(train_ids) != split["train_source_record_ids"]
+                or sorted(eval_ids) != split["eval_source_record_ids"]
+                or train_ids & eval_ids
+                or clean.source_manifest_hash != evaluation.source_manifest_hash
+                or split["source_manifest_hash"] != clean.source_manifest_hash
+            ):
+                raise EvaluationBlocked("clean split does not match verified graph memberships")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise EvaluationBlocked("clean split artifact is invalid") from exc
+        source_rows = self._load_source_rows(clean.source_manifest_hash, clean.source_record_count)
+        training_samples = self._materialize(clean, source_rows)
+        evaluation_samples = self._materialize(evaluation, source_rows)
+        predictions = self._predict(training_samples, evaluation_samples)
+        metrics = self._metrics(predictions)
+        stable_id = hashlib.sha256(f"{job_id}\0{original_run_id}".encode()).hexdigest()[:24]
+        run_id = f"run:repair:{stable_id}"
+        experiment_id = f"experiment:repair:{stable_id}"
+        self._graph.create_recovery_experiment(
+            job_id, original_run_id, experiment_id, clean.dataset_id, evaluation.dataset_id
+        )
+        model_bytes = b"".join(
+            (json.dumps(asdict(sample), sort_keys=True, separators=(",", ":")) + "\n").encode()
+            for sample in training_samples
+        )
+        model_sha256 = hashlib.sha256(model_bytes).hexdigest()
+        run = self._write_run_artifacts(
+            experiment_id,
+            clean,
+            evaluation,
+            len(training_samples),
+            predictions,
+            metrics,
+            run_id=run_id,
+            model_bytes=model_bytes,
+        )
+        self._graph.record_run(run)
+        self._graph.link_recovery_run(
+            job_id,
+            original_run_id,
+            run_id,
+            str(Path(run.artifact_path) / "model-training-rows.jsonl"),
+            model_sha256,
+        )
+        return self._graph.get_run(run_id), model_sha256
+
     def _load_source_rows(self, expected_digest: str, expected_count: int) -> dict[str, SourceRow]:
         source_path = self._artifact_dir / "source_records.jsonl"
         try:
@@ -249,8 +317,11 @@ class DemoEvaluationRunner:
         training_sample_count: int,
         predictions: list[Prediction],
         metrics: BinaryMetrics,
+        *,
+        run_id: str | None = None,
+        model_bytes: bytes | None = None,
     ) -> ExperimentRunRecord:
-        run_id = f"run-{experiment_id}-{uuid4().hex}"
+        run_id = run_id or f"run-{experiment_id}-{uuid4().hex}"
         created_at = datetime.now(UTC).isoformat(timespec="milliseconds")
         python_version = platform.python_version()
         prediction_bytes = b"".join(
@@ -265,6 +336,8 @@ class DemoEvaluationRunner:
         artifact_dir.mkdir(parents=True, exist_ok=False)
         prediction_path = artifact_dir / "predictions.jsonl"
         self._write_atomic(prediction_path, prediction_bytes)
+        if model_bytes is not None:
+            self._write_atomic(artifact_dir / "model-training-rows.jsonl", model_bytes)
 
         manifest_payload: dict[str, Any] = {
             "run_id": run_id,
@@ -283,6 +356,8 @@ class DemoEvaluationRunner:
             "metrics": asdict(metrics),
             "prediction_sha256": prediction_sha256,
         }
+        if model_bytes is not None:
+            manifest_payload["model_sha256"] = hashlib.sha256(model_bytes).hexdigest()
         manifest_bytes = json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )

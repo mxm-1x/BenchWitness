@@ -22,6 +22,7 @@ from benchwitness_api.graph_lineage import (
     QuarantineActionRecord,
 )
 from benchwitness_api.impact import ActionNotAllowed, ImpactService
+from benchwitness_api.recovery import RecoveryQueueUnavailable, RecoveryService, queue_from_env
 from benchwitness_api.settings import GraphSettings
 
 
@@ -161,6 +162,18 @@ class QuarantineActionResponse(BaseModel):
     approved_at: str | None
 
 
+class RecoveryJobResponse(BaseModel):
+    job_id: str
+    action_id: str
+    status: Literal["pending_enqueue", "queued", "running", "succeeded", "failed"]
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    error: str | None
+    original_run_ids: list[str]
+    repaired_run_ids: list[str]
+
+
 @lru_cache(maxsize=1)
 def get_graph_probe() -> GraphProbe:
     return GraphProbe(GraphSettings.from_env())
@@ -184,6 +197,11 @@ def get_demo_evaluation_runner() -> DemoEvaluationRunner:
 @lru_cache(maxsize=1)
 def get_impact_service() -> ImpactService:
     return ImpactService(get_graph_lineage_store())
+
+
+@lru_cache(maxsize=1)
+def get_recovery_service() -> RecoveryService:
+    return RecoveryService(get_graph_lineage_store(), queue_from_env())
 
 
 app = FastAPI(title="BenchWitness API", version="0.1.0")
@@ -459,3 +477,60 @@ def approve_quarantine(
             status_code=503,
             content={"error": "graph_unavailable", "message": "FalkorDB approval failed"},
         )
+
+
+@app.post(
+    "/api/v1/investigations/{investigation_id}/repair-proposals",
+    response_model=QuarantineActionResponse,
+)
+def propose_repair(
+    investigation_id: str,
+    request: QuarantineProposalRequest,
+    service: Annotated[RecoveryService, Depends(get_recovery_service)],
+) -> QuarantineActionResponse | JSONResponse:
+    try:
+        return _quarantine_action_response(service.propose(investigation_id, request.reason))
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "investigation_not_found"})
+    except ActionNotAllowed as exc:
+        return JSONResponse(
+            status_code=409, content={"error": "repair_not_allowed", "message": str(exc)}
+        )
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
+
+
+@app.post("/api/v1/repairs/{action_id}/approve", response_model=RecoveryJobResponse)
+def approve_repair(
+    action_id: str,
+    request: QuarantineApprovalRequest,
+    approver: Annotated[str, Depends(get_approval_identity)],
+    service: Annotated[RecoveryService, Depends(get_recovery_service)],
+) -> RecoveryJobResponse | JSONResponse:
+    try:
+        return RecoveryJobResponse(
+            **service.approve_and_enqueue(action_id, approver, request.reason).__dict__
+        )
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "repair_action_not_found"})
+    except ActionNotAllowed as exc:
+        return JSONResponse(
+            status_code=409, content={"error": "repair_not_allowed", "message": str(exc)}
+        )
+    except RecoveryQueueUnavailable:
+        return JSONResponse(status_code=503, content={"error": "broker_unavailable"})
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
+
+
+@app.get("/api/v1/jobs/{job_id}", response_model=RecoveryJobResponse)
+def get_recovery_job(
+    job_id: str,
+    service: Annotated[RecoveryService, Depends(get_recovery_service)],
+) -> RecoveryJobResponse | JSONResponse:
+    try:
+        return RecoveryJobResponse(**service.get_job(job_id).__dict__)
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "job_not_found"})
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})

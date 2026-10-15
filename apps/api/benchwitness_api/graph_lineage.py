@@ -370,6 +370,82 @@ RETURN action.id, action.investigation_id, action.action_type, action.reason,
 LIMIT 1
 """
 
+_PROPOSE_REPAIR = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->(finding:Finding)
+WHERE finding.status = 'confirmed' AND finding.coverage_complete = true
+MATCH (finding)-[:IMPACTS]->(claim:EvaluationClaim)
+WITH investigation, finding, collect(DISTINCT claim) AS claims
+WHERE size(claims) > 0
+MERGE (action:ActionProposal {id: $action_id})
+ON CREATE SET action.action_type = 'repair', action.investigation_id = investigation.id,
+              action.reason = $reason, action.created_at = $created_at
+MERGE (action)-[:BASED_ON]->(finding)
+WITH action, claims
+UNWIND claims AS claim
+MERGE (action)-[:TARGETS]->(claim)
+RETURN action.id, count(claim)
+"""
+_APPROVE_REPAIR = """
+MATCH (action:ActionProposal {id: $action_id, action_type: 'repair'})-[:BASED_ON]->
+      (finding:Finding {status: 'confirmed', coverage_complete: true})
+MATCH (action)-[:TARGETS]->(claim:EvaluationClaim)
+WITH action, count(DISTINCT claim) AS target_count
+WHERE target_count > 0
+MERGE (approval:ApprovalDecision {id: $approval_id})
+ON CREATE SET approval.approver = $approver, approval.reason = $reason,
+              approval.created_at = $created_at
+MERGE (approval)-[:APPROVES]->(action)
+RETURN approval.id
+"""
+_CREATE_RECOVERY_JOB = """
+MATCH (approval:ApprovalDecision)-[:APPROVES]->(action:ActionProposal
+      {id: $action_id, action_type: 'repair'})
+MERGE (job:RecoveryJob {id: $job_id})
+ON CREATE SET job.status = 'pending_enqueue', job.created_at = $created_at,
+              job.original_run_ids = $original_run_ids
+MERGE (action)-[:STARTS]->(job)
+RETURN job.id
+"""
+_GET_RECOVERY_JOB = """
+MATCH (action:ActionProposal)-[:STARTS]->(job:RecoveryJob {id: $job_id})
+RETURN job.id, action.id, job.status, job.created_at, job.started_at,
+       job.finished_at, job.error, job.original_run_ids, job.repaired_run_ids
+LIMIT 1
+"""
+_SET_RECOVERY_JOB_STATUS = """
+MATCH (job:RecoveryJob {id: $job_id})
+WHERE job.status = $expected_status
+SET job.status = $status, job.started_at = $started_at,
+    job.finished_at = $finished_at, job.error = $error,
+    job.repaired_run_ids = $repaired_run_ids
+RETURN job.id
+"""
+_LINK_RECOVERY_RUN = """
+MATCH (job:RecoveryJob {id: $job_id})
+MATCH (original:ExperimentRun {id: $original_run_id})
+MATCH (repaired:ExperimentRun {id: $repaired_run_id})
+MERGE (job)-[:REPAIRS]->(original)
+MERGE (job)-[:PRODUCED]->(repaired)
+MERGE (repaired)-[:REPLACES]->(original)
+MERGE (model:ModelVersion {id: $model_version_id})
+ON CREATE SET model.artifact_path = $model_artifact_path,
+              model.sha256 = $model_sha256, model.created_at = $created_at
+MERGE (repaired)-[:PRODUCED_MODEL]->(model)
+RETURN repaired.id
+"""
+_CREATE_RECOVERY_EXPERIMENT = """
+MATCH (job:RecoveryJob {id: $job_id})
+MATCH (original:ExperimentRun {id: $original_run_id})
+MATCH (training:DatasetVersion {id: $training_dataset_id})
+MATCH (evaluation:DatasetVersion {id: $evaluation_dataset_id})
+MERGE (experiment:Experiment {id: $experiment_id})
+ON CREATE SET experiment.recovery_job_id = job.id, experiment.original_run_id = original.id
+MERGE (experiment)-[:TRAINS_ON]->(training)
+MERGE (experiment)-[:TESTS_ON]->(evaluation)
+MERGE (experiment)-[:REPAIRS_RUN]->(original)
+RETURN experiment.id
+"""
+
 
 class LineageGraphError(RuntimeError):
     """A fixed graph operation failed or returned an invalid result."""
@@ -513,6 +589,19 @@ class QuarantineActionRecord:
     approver: str | None = None
     approval_reason: str | None = None
     approved_at: str | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryJobRecord:
+    job_id: str
+    action_id: str
+    status: Literal["pending_enqueue", "queued", "running", "succeeded", "failed"]
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    error: str | None
+    original_run_ids: tuple[str, ...]
+    repaired_run_ids: tuple[str, ...]
 
 
 class GraphLineageStore:
@@ -1175,6 +1264,177 @@ class GraphLineageStore:
             approval_reason=first_string(row[8]),
             approved_at=first_string(row[9]),
         )
+
+    def propose_repair(self, investigation_id: str, reason: str) -> QuarantineActionRecord:
+        investigation = self.get_investigation(investigation_id)
+        if investigation.finding_status != "confirmed" or not investigation.coverage_complete:
+            raise ActionNotAllowed("repair requires confirmed evidence and complete scope")
+        action_id = f"action:repair:{investigation_id}"
+        rows = self._query(
+            _PROPOSE_REPAIR,
+            {
+                "investigation_id": investigation_id,
+                "action_id": action_id,
+                "reason": reason,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            },
+        )
+        if len(rows) != 1 or len(rows[0]) != 2 or not rows[0][1]:
+            raise ActionNotAllowed("investigation has no eligible claims to repair")
+        return self.get_repair_action(action_id)
+
+    def get_repair_action(self, action_id: str) -> QuarantineActionRecord:
+        rows = self._query(_GET_ACTION, {"action_id": action_id})
+        if len(rows) != 1 or len(rows[0]) != 10 or rows[0][2] != "repair":
+            raise KeyError(action_id)
+        row = rows[0]
+
+        def first(values: Any) -> str | None:
+            return next((str(value) for value in values if value is not None), None)
+
+        approval_id = first(row[6] or [])
+        return QuarantineActionRecord(
+            action_id=str(row[0]),
+            investigation_id=str(row[1]),
+            status="approved" if approval_id else "proposed",
+            reason=str(row[3]),
+            created_at=str(row[4]),
+            target_claim_ids=tuple(sorted(str(value) for value in row[5] if value is not None)),
+            approval_id=approval_id,
+            approver=first(row[7] or []),
+            approval_reason=first(row[8] or []),
+            approved_at=first(row[9] or []),
+        )
+
+    def approve_repair(self, action_id: str, approver: str, reason: str) -> QuarantineActionRecord:
+        action = self.get_repair_action(action_id)
+        if action.status == "approved":
+            return action
+        investigation = self.get_investigation(action.investigation_id)
+        if investigation.finding_status != "confirmed" or not investigation.coverage_complete:
+            raise ActionNotAllowed("repair approval requires complete confirmed evidence")
+        approval_id = f"approval:{action_id}"
+        rows = self._query(
+            _APPROVE_REPAIR,
+            {
+                "action_id": action_id,
+                "approval_id": approval_id,
+                "approver": approver,
+                "reason": reason,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            },
+        )
+        if rows != [[approval_id]]:
+            raise ActionNotAllowed("repair proposal is missing or no longer eligible")
+        return self.get_repair_action(action_id)
+
+    def create_recovery_job(
+        self, action_id: str, original_run_ids: tuple[str, ...]
+    ) -> RecoveryJobRecord:
+        action = self.get_repair_action(action_id)
+        if action.status != "approved" or not original_run_ids:
+            raise ActionNotAllowed("repair job requires approval and measured impacted runs")
+        job_id = f"job:repair:{action_id}"
+        rows = self._query(
+            _CREATE_RECOVERY_JOB,
+            {
+                "action_id": action_id,
+                "job_id": job_id,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                "original_run_ids": list(original_run_ids),
+            },
+        )
+        if rows != [[job_id]]:
+            raise LineageGraphError("FalkorDB did not persist the recovery job")
+        return self.get_recovery_job(job_id)
+
+    def get_recovery_job(self, job_id: str) -> RecoveryJobRecord:
+        rows = self._query(_GET_RECOVERY_JOB, {"job_id": job_id})
+        if not rows:
+            raise KeyError(job_id)
+        if len(rows) != 1 or len(rows[0]) != 9:
+            raise LineageGraphError("FalkorDB returned invalid recovery job data")
+        row = rows[0]
+        return RecoveryJobRecord(
+            job_id=str(row[0]),
+            action_id=str(row[1]),
+            status=str(row[2]),  # type: ignore[arg-type]
+            created_at=str(row[3]),
+            started_at=str(row[4]) if row[4] else None,
+            finished_at=str(row[5]) if row[5] else None,
+            error=str(row[6]) if row[6] else None,
+            original_run_ids=tuple(str(value) for value in (row[7] or [])),
+            repaired_run_ids=tuple(str(value) for value in (row[8] or [])),
+        )
+
+    def transition_recovery_job(
+        self,
+        job_id: str,
+        expected: str,
+        status: str,
+        *,
+        error: str | None = None,
+        repaired_run_ids: tuple[str, ...] = (),
+    ) -> bool:
+        current = self.get_recovery_job(job_id)
+        now = datetime.now(UTC).isoformat(timespec="milliseconds")
+        rows = self._query(
+            _SET_RECOVERY_JOB_STATUS,
+            {
+                "job_id": job_id,
+                "expected_status": expected,
+                "status": status,
+                "started_at": now if status == "running" else current.started_at,
+                "finished_at": now if status in ("succeeded", "failed") else None,
+                "error": error,
+                "repaired_run_ids": list(repaired_run_ids),
+            },
+        )
+        return rows == [[job_id]]
+
+    def link_recovery_run(
+        self,
+        job_id: str,
+        original_run_id: str,
+        repaired_run_id: str,
+        model_artifact_path: str,
+        model_sha256: str,
+    ) -> None:
+        rows = self._query(
+            _LINK_RECOVERY_RUN,
+            {
+                "job_id": job_id,
+                "original_run_id": original_run_id,
+                "repaired_run_id": repaired_run_id,
+                "model_version_id": f"model-version:{repaired_run_id}",
+                "model_artifact_path": model_artifact_path,
+                "model_sha256": model_sha256,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            },
+        )
+        if rows != [[repaired_run_id]]:
+            raise LineageGraphError("FalkorDB did not link the recovery run and model version")
+
+    def create_recovery_experiment(
+        self,
+        job_id: str,
+        original_run_id: str,
+        experiment_id: str,
+        training_dataset_id: str,
+        evaluation_dataset_id: str,
+    ) -> None:
+        rows = self._query(
+            _CREATE_RECOVERY_EXPERIMENT,
+            {
+                "job_id": job_id,
+                "original_run_id": original_run_id,
+                "experiment_id": experiment_id,
+                "training_dataset_id": training_dataset_id,
+                "evaluation_dataset_id": evaluation_dataset_id,
+            },
+        )
+        if rows != [[experiment_id]]:
+            raise LineageGraphError("FalkorDB did not persist the recovery experiment")
 
     def _count_untraced(self, dataset_id: str) -> int:
         rows = self._query(_COUNT_UNTRACED_SAMPLES, {"dataset_id": dataset_id})

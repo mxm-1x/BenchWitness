@@ -1,6 +1,6 @@
 # BenchWitness — phase and GitHub delivery plan
 
-**Live delivery plan, updated 15 October 2026.** Milestones 1–3 are complete. Milestone 4 implementation and verification are at the review gate. This plan complements [PROJECT_BLUEPRINT.md](PROJECT_BLUEPRINT.md), [PRE_EVENT_STRATEGY.md](PRE_EVENT_STRATEGY.md), and the first [kickoff prompt](CODEX_KICKOFF_PROMPT.md).
+**Live delivery plan, updated 16 October 2026.** Milestones 1–4 are complete. Milestone 5 implementation and verification are at the review gate. This plan complements [PROJECT_BLUEPRINT.md](PROJECT_BLUEPRINT.md), [PRE_EVENT_STRATEGY.md](PRE_EVENT_STRATEGY.md), and the first [kickoff prompt](CODEX_KICKOFF_PROMPT.md).
 
 The data inputs and controls for Phases 2–5 are listed in [DATASET_INVENTORY.md](DATASET_INVENTORY.md).
 

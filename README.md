@@ -1,6 +1,6 @@
 # BenchWitness
 
-BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–4 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, and approval-gated quarantine. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
+BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–5 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, approval-gated quarantine, and approved clean recovery through a separate Redis worker. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
 
 ## Layout
 
@@ -8,9 +8,10 @@ BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Mil
 |---|---|
 | `apps/api/benchwitness_api` | FastAPI app, synthetic lineage generator, graph seed and audit |
 | `apps/api/benchwitness_api/impact.py` | Bounded impact investigation and quarantine approval service |
+| `apps/api/benchwitness_api/recovery.py` | Repair approval and Redis dispatch |
 | `apps/api/tests` | API smoke, deterministic fixture and real-graph integration tests |
 | `apps/web` | React, TypeScript and Vite application shell |
-| `workers/ml/benchwitness_ml` | Deterministic CPU experiment runner and run CLI |
+| `workers/ml/benchwitness_ml` | Deterministic CPU runner and approved repair worker |
 | `infra` | Infrastructure notes; root `compose.yaml` is the runnable setup |
 
 ## Requirements
@@ -39,7 +40,7 @@ docker compose ps
 
 `nvm use` selects the version in `.nvmrc`. If you do not use nvm, select Node.js 20.19+ by another method before `npm ci`; Vite requires that version. The current macOS machine also has an older `/usr/local/bin/node`, so check `node --version` if Vite reports an engine warning.
 
-The graph uses `127.0.0.1:6379`; the **separate** Redis job broker uses `127.0.0.1:6380`. `/readyz` checks FalkorDB. Redis has no worker jobs yet. The FalkorDB container uses a named volume; `docker compose down` keeps it.
+The graph uses `127.0.0.1:6379`; the **separate** Redis job broker uses `127.0.0.1:6380`. `/readyz` checks FalkorDB. The FalkorDB container uses a named volume; `docker compose down` keeps it.
 
 Verify the graph engine, then start the API:
 
@@ -84,7 +85,7 @@ uv run benchwitness-run-demo
 
 The API equivalent is `POST /api/v1/demo/evaluate`. Each invocation appends three new run versions; repeated runs use new run IDs and artifacts while producing the same metrics for unchanged seeded inputs. The runner uses 1-nearest-neighbor with squared Euclidean distance and deterministic sample-ID tie breaking. Accuracy, positive-class precision/recall/F1, and confusion counts are computed from saved predictions. Each run manifest records dataset IDs, model configuration, metric definition, counts, and checksums. Generated artifacts under `artifacts/runs/` are ignored by Git.
 
-These are measured results on the included synthetic scenario, not a promise that contamination changes scores in a particular direction. The API runs this small demo synchronously. Redis remains reserved for the later approved recovery job milestone. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
+These are measured results on the included synthetic scenario, not a promise that contamination changes scores in a particular direction. The API runs this small demo synchronously. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
 
 ## Trace impact and quarantine a result
 
@@ -110,6 +111,27 @@ curl -sS "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>"
 The investigation then reports those claims as `quarantined` by following the approved decision edge. Original run records, evaluation claims, and metric values remain stored unchanged. The local bearer token guards every API `POST`, and the configured approver label is recorded with approval. This is a single-reviewer local gate; do not expose the API publicly without deployment-grade authentication and authorization.
 
 The graph represents a measured run as `ExperimentRun -[:USES_MODEL_CONFIGURATION]-> ModelConfiguration`, `ExperimentRun -[:HAS_EVALUATION]-> EvaluationClaim`, and `EvaluationClaim -[:REPORTS]-> MetricClaim`. An `Investigation` establishes a `Finding`; the finding points to exact `LineageEvidence` paths and impacted evaluation claims. `ActionProposal -[:TARGETS]-> EvaluationClaim` records proposed scope, while `ApprovalDecision -[:APPROVES]-> ActionProposal` records explicit approval.
+
+## Approve and run clean recovery
+
+Start the worker in a third terminal, from the repository root with `.env` sourced as above:
+
+```sh
+set -a
+source .env
+set +a
+uv run benchwitness-worker
+```
+
+With a confirmed, complete investigation from `/api/v1/impact`, propose a repair. The proposal alone does not enqueue work. Review its target claim IDs, then approve separately with the local bearer token:
+
+```sh
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>/repair-proposals" -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN" -H 'Content-Type: application/json' -d '{"reason":"Restore the intended held-out split"}'
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/repairs/<action_id>/approve" -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN" -H 'Content-Type: application/json' -d '{"reason":"I reviewed the affected claims and approve a clean refit"}'
+curl -sS "http://127.0.0.1:8000/api/v1/jobs/<job_id>"
+```
+
+The worker verifies the clean training and held-out evaluation memberships against FalkorDB and the saved split manifest, refits the fixed 1-nearest-neighbor classifier on the clean records, calculates fresh predictions and metrics, then appends a recovery experiment/run and hashed model-training-row artifact for each affected original run. `RecoveryJob` state and approval are stored in FalkorDB; Redis holds transient dispatch only. The `repaired_run_ids` in the job response can be inspected against the original run IDs. Repeating the approval request returns the same job and does not enqueue another copy. A broker failure appears as a `failed` graph job with an error code. If the worker process stops while a job is running, inspect the graph job and RQ state before restarting; automatic crash reconciliation is not yet implemented.
 
 To start the frontend shell:
 
@@ -137,4 +159,4 @@ npm run build --prefix apps/web
 
 ## Milestone boundary
 
-Milestone 5 adds approved clean recovery through the Redis-backed worker. It is not implemented here. Do not treat lineage overlap as a measured score impact. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. Human review is required before the next milestone. AI-assisted implementation must be disclosed in the final submission.
+Milestone 5 is implemented for the fixed local synthetic scenario. Do not treat lineage overlap as a measured score impact. Milestone 6 adds typed agent tools and graph-backed memory after human review. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. AI-assisted implementation must be disclosed in the final submission.
