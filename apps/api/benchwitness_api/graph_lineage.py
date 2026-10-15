@@ -312,10 +312,14 @@ _GET_IMPACT_EVIDENCE = """
 MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
       (finding:Finding)-[:SUPPORTED_BY]->(evidence:LineageEvidence)
 MATCH (evidence)-[:RELATES_TO]->(claim:EvaluationClaim)
-RETURN evidence.run_id, evidence.canonical_source_record_id,
-       evidence.training_dataset_id, evidence.training_sample_id,
-       evidence.training_derivation_hops, evidence.evaluation_dataset_id,
-       evidence.evaluation_sample_id, evidence.evaluation_derivation_hops
+MATCH (evidence)-[:USES_SOURCE]->(source:SourceRecord)
+MATCH (evidence)-[:TRAINING_DATASET]->(training:DatasetVersion)
+MATCH (evidence)-[:TRAINING_SAMPLE]->(training_sample:SampleVersion)
+MATCH (evidence)-[:EVALUATION_DATASET]->(evaluation:DatasetVersion)
+MATCH (evidence)-[:EVALUATION_SAMPLE]->(evaluation_sample:SampleVersion)
+RETURN evidence.run_id, source.id, training.id, training_sample.id,
+       evidence.training_derivation_hops, evaluation.id,
+       evaluation_sample.id, evidence.evaluation_derivation_hops
 LIMIT $limit
 """
 _GET_QUARANTINED_CLAIMS = """
@@ -444,6 +448,46 @@ MERGE (experiment)-[:TRAINS_ON]->(training)
 MERGE (experiment)-[:TESTS_ON]->(evaluation)
 MERGE (experiment)-[:REPAIRS_RUN]->(original)
 RETURN experiment.id
+"""
+_CREATE_AGENT_SESSION = """
+CREATE (session:AgentSession {id: $session_id, created_at: $created_at})
+RETURN session.id, session.created_at
+"""
+_GET_AGENT_SESSION = """
+MATCH (session:AgentSession {id: $session_id})
+RETURN session.id, session.created_at
+LIMIT 1
+"""
+_GET_LATEST_AGENT_MEMORY = """
+MATCH (memory:AgentMemory {source_record_id: $source_record_id})-[:REFERS_TO]->
+      (investigation:Investigation)
+RETURN memory.id, memory.source_record_id, memory.investigation_id,
+       memory.fingerprint, memory.created_at
+ORDER BY memory.created_at DESC
+LIMIT 1
+"""
+_RECORD_AGENT_MEMORY = """
+MATCH (session:AgentSession {id: $session_id})
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding {status: 'confirmed', coverage_complete: true})
+MATCH (source:SourceRecord {id: $source_record_id})
+WHERE investigation.source_record_id = source.id
+MERGE (memory:AgentMemory {id: $memory_id})
+ON CREATE SET memory.source_record_id = source.id,
+              memory.investigation_id = investigation.id,
+              memory.fingerprint = $fingerprint,
+              memory.created_at = $created_at
+MERGE (session)-[:RECORDED]->(memory)
+MERGE (memory)-[:REFERS_TO]->(investigation)
+MERGE (memory)-[:USES_SOURCE]->(source)
+RETURN memory.id
+"""
+_RECALL_AGENT_MEMORY = """
+MATCH (session:AgentSession {id: $session_id})
+MATCH (memory:AgentMemory {id: $memory_id})-[:REFERS_TO]->
+      (investigation:Investigation)
+MERGE (session)-[:REMEMBERS]->(memory)
+RETURN memory.id
 """
 
 
@@ -602,6 +646,21 @@ class RecoveryJobRecord:
     error: str | None
     original_run_ids: tuple[str, ...]
     repaired_run_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AgentSessionRecord:
+    session_id: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AgentMemoryRecord:
+    memory_id: str
+    source_record_id: str
+    investigation_id: str
+    fingerprint: str
+    created_at: str
 
 
 class GraphLineageStore:
@@ -1435,6 +1494,69 @@ class GraphLineageStore:
         )
         if rows != [[experiment_id]]:
             raise LineageGraphError("FalkorDB did not persist the recovery experiment")
+
+    def create_agent_session(self, session_id: str) -> AgentSessionRecord:
+        created_at = datetime.now(UTC).isoformat(timespec="milliseconds")
+        rows = self._query(
+            _CREATE_AGENT_SESSION, {"session_id": session_id, "created_at": created_at}
+        )
+        if rows != [[session_id, created_at]]:
+            raise LineageGraphError("FalkorDB did not create the agent session")
+        return AgentSessionRecord(session_id, created_at)
+
+    def get_agent_session(self, session_id: str) -> AgentSessionRecord:
+        rows = self._query(_GET_AGENT_SESSION, {"session_id": session_id})
+        if not rows:
+            raise KeyError(session_id)
+        if len(rows) != 1 or len(rows[0]) != 2:
+            raise LineageGraphError("FalkorDB returned invalid agent session data")
+        return AgentSessionRecord(str(rows[0][0]), str(rows[0][1]))
+
+    def latest_agent_memory(self, source_record_id: str) -> AgentMemoryRecord | None:
+        rows = self._query(_GET_LATEST_AGENT_MEMORY, {"source_record_id": source_record_id})
+        if not rows:
+            return None
+        if len(rows) != 1 or len(rows[0]) != 5:
+            raise LineageGraphError("FalkorDB returned invalid agent memory data")
+        row = rows[0]
+        return AgentMemoryRecord(*(str(value) for value in row))
+
+    def record_agent_memory(
+        self,
+        session_id: str,
+        investigation_id: str,
+        source_record_id: str,
+        fingerprint: str,
+    ) -> AgentMemoryRecord:
+        memory_id = f"agent-memory:{investigation_id}"
+        rows = self._query(
+            _RECORD_AGENT_MEMORY,
+            {
+                "session_id": session_id,
+                "investigation_id": investigation_id,
+                "source_record_id": source_record_id,
+                "memory_id": memory_id,
+                "fingerprint": fingerprint,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            },
+        )
+        if rows != [[memory_id]]:
+            raise LineageGraphError("FalkorDB did not record verified agent memory")
+        memory = self.latest_agent_memory(source_record_id)
+        if memory is None or memory.memory_id != memory_id:
+            raise LineageGraphError("FalkorDB did not return the recorded agent memory")
+        return memory
+
+    def recall_agent_memory(self, session_id: str, memory_id: str) -> None:
+        rows = self._query(
+            _RECALL_AGENT_MEMORY,
+            {
+                "session_id": session_id,
+                "memory_id": memory_id,
+            },
+        )
+        if rows != [[memory_id]]:
+            raise LineageGraphError("FalkorDB did not link recalled memory to the session")
 
     def _count_untraced(self, dataset_id: str) -> int:
         rows = self._query(_COUNT_UNTRACED_SAMPLES, {"dataset_id": dataset_id})

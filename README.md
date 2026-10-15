@@ -1,6 +1,6 @@
 # BenchWitness
 
-BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–5 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, approval-gated quarantine, and approved clean recovery through a separate Redis worker. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
+BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–6 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, approval-gated quarantine, approved clean recovery, and typed agent tools with cross-session memory. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
 
 ## Layout
 
@@ -9,6 +9,7 @@ BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Mil
 | `apps/api/benchwitness_api` | FastAPI app, synthetic lineage generator, graph seed and audit |
 | `apps/api/benchwitness_api/impact.py` | Bounded impact investigation and quarantine approval service |
 | `apps/api/benchwitness_api/recovery.py` | Repair approval and Redis dispatch |
+| `apps/api/benchwitness_api/agent.py` | Typed local tool routing and verified graph memory |
 | `apps/api/tests` | API smoke, deterministic fixture and real-graph integration tests |
 | `apps/web` | React, TypeScript and Vite application shell |
 | `workers/ml/benchwitness_ml` | Deterministic CPU runner and approved repair worker |
@@ -133,6 +134,19 @@ curl -sS "http://127.0.0.1:8000/api/v1/jobs/<job_id>"
 
 The worker verifies the clean training and held-out evaluation memberships against FalkorDB and the saved split manifest, refits the fixed 1-nearest-neighbor classifier on the clean records, calculates fresh predictions and metrics, then appends a recovery experiment/run and hashed model-training-row artifact for each affected original run. `RecoveryJob` state and approval are stored in FalkorDB; Redis holds transient dispatch only. The `repaired_run_ids` in the job response can be inspected against the original run IDs. Repeating the approval request returns the same job and does not enqueue another copy. A broker failure appears as a `failed` graph job with an error code. If the worker process stops while a job is running, inspect the graph job and RQ state before restarting; automatic crash reconciliation is not yet implemented.
 
+## Typed agent and graph memory
+
+Create a session, then send a typed intent. Use a confirmed source ID from the lineage audit. Supply the returned `session_id` in the message URL:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/api/v1/agent/sessions -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN"
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/agent/sessions/<session_id>/messages" -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN" -H 'Content-Type: application/json' -d '{"intent":"investigate_source","subject_id":"<canonical_source_record_id>"}'
+```
+
+Supported intents are `investigate_source`, `audit_experiment`, and `get_job_status`; `subject_id` is the corresponding source, experiment, or job ID. The response names the tools used and returns typed, graph-backed results. A confirmed, complete source investigation creates `AgentMemory` linked to its `Investigation` and `AgentSession`. A new session checks the current bounded run set, manifest hashes, audit results, and exact impact sample paths before recalling that memory. If the graph has changed, it performs a new investigation and reports `memory_status: stale`. It never treats memory alone as proof of current cleanliness. This local agent is deterministic and does not call an LLM or accept executable tool instructions. Repair and quarantine still require their separate explicit approval endpoints.
+
+To demonstrate memory, create a **second** session with the first command and send the same `investigate_source` request using its new `session_id`. Its response should report `memory_status: verified` and the prior `investigation_id` if no run or lineage changed. Run `uv run benchwitness-run-demo` again, then repeat from a third session: the additional measured runs make the earlier snapshot stale, so a new investigation is recorded. `GET /api/v1/agent/sessions/<session_id>` confirms a session exists in FalkorDB.
+
 To start the frontend shell:
 
 ```sh
@@ -159,4 +173,4 @@ npm run build --prefix apps/web
 
 ## Milestone boundary
 
-Milestone 5 is implemented for the fixed local synthetic scenario. Do not treat lineage overlap as a measured score impact. Milestone 6 adds typed agent tools and graph-backed memory after human review. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. AI-assisted implementation must be disclosed in the final submission.
+Milestone 6 is implemented for the fixed local synthetic scenario. Do not treat lineage overlap as a measured score impact. Milestone 7 adds the Opensource UI investigation dashboard after human review. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. AI-assisted implementation must be disclosed in the final submission.

@@ -12,9 +12,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.responses import Response
 
+from benchwitness_api.agent import AgentIntent, AgentService, AgentToolResult
 from benchwitness_api.demo_seed import DemoSeedService, artifact_directory_from_env
 from benchwitness_api.graph import GraphProbe, GraphUnavailable
 from benchwitness_api.graph_lineage import (
+    AuditResult,
     GraphLineageStore,
     ImpactInvestigationRecord,
     ImpactScopeExceeded,
@@ -174,6 +176,29 @@ class RecoveryJobResponse(BaseModel):
     repaired_run_ids: list[str]
 
 
+class AgentSessionResponse(BaseModel):
+    session_id: str
+    created_at: str
+
+
+class AgentMessageRequest(BaseModel):
+    intent: AgentIntent
+    subject_id: str = Field(min_length=1, max_length=200)
+
+
+class AgentMessageResponse(BaseModel):
+    session_id: str
+    intent: AgentIntent
+    subject_id: str
+    tools_used: list[str]
+    memory_status: Literal["none", "verified", "stale"]
+    memory_id: str | None
+    summary: str
+    investigation: ImpactInvestigationResponse | None
+    audit: LineageAuditResponse | None
+    job: RecoveryJobResponse | None
+
+
 @lru_cache(maxsize=1)
 def get_graph_probe() -> GraphProbe:
     return GraphProbe(GraphSettings.from_env())
@@ -202,6 +227,11 @@ def get_impact_service() -> ImpactService:
 @lru_cache(maxsize=1)
 def get_recovery_service() -> RecoveryService:
     return RecoveryService(get_graph_lineage_store(), queue_from_env())
+
+
+@lru_cache(maxsize=1)
+def get_agent_service() -> AgentService:
+    return AgentService(get_graph_lineage_store())
 
 
 app = FastAPI(title="BenchWitness API", version="0.1.0")
@@ -289,6 +319,37 @@ def _quarantine_action_response(action: QuarantineActionRecord) -> QuarantineAct
     )
 
 
+def _audit_response(result: AuditResult) -> LineageAuditResponse:
+    return LineageAuditResponse(
+        experiment_id=result.experiment_id,
+        status=result.status,
+        coverage_complete=result.coverage_complete,
+        training_dataset_id=result.training_dataset_id,
+        evaluation_dataset_id=result.evaluation_dataset_id,
+        training_samples_without_source=result.training_samples_without_source,
+        evaluation_samples_without_source=result.evaluation_samples_without_source,
+        training_manifest_verified=result.training_manifest_verified,
+        evaluation_manifest_verified=result.evaluation_manifest_verified,
+        source_artifact_verified=result.source_artifact_verified,
+        evidence=[LineageEvidenceResponse(**evidence.__dict__) for evidence in result.evidence],
+    )
+
+
+def _agent_response(result: AgentToolResult) -> AgentMessageResponse:
+    return AgentMessageResponse(
+        session_id=result.session_id,
+        intent=result.intent,
+        subject_id=result.subject_id,
+        tools_used=list(result.tools_used),
+        memory_status=result.memory_status,
+        memory_id=result.memory_id,
+        summary=result.summary,
+        investigation=_impact_response(result.investigation) if result.investigation else None,
+        audit=_audit_response(result.audit) if result.audit else None,
+        job=RecoveryJobResponse(**result.job.__dict__) if result.job else None,
+    )
+
+
 @app.get("/healthz", response_model=HealthStatus)
 def healthz() -> HealthStatus:
     return HealthStatus()
@@ -337,19 +398,7 @@ def audit_experiment_lineage(
             status_code=503,
             content={"error": "graph_unavailable", "message": "FalkorDB audit failed"},
         )
-    return LineageAuditResponse(
-        experiment_id=result.experiment_id,
-        status=result.status,
-        coverage_complete=result.coverage_complete,
-        training_dataset_id=result.training_dataset_id,
-        evaluation_dataset_id=result.evaluation_dataset_id,
-        training_samples_without_source=result.training_samples_without_source,
-        evaluation_samples_without_source=result.evaluation_samples_without_source,
-        training_manifest_verified=result.training_manifest_verified,
-        evaluation_manifest_verified=result.evaluation_manifest_verified,
-        source_artifact_verified=result.source_artifact_verified,
-        evidence=[LineageEvidenceResponse(**evidence.__dict__) for evidence in result.evidence],
-    )
+    return _audit_response(result)
 
 
 @app.post("/api/v1/demo/evaluate", response_model=DemoEvaluationResponse)
@@ -532,5 +581,46 @@ def get_recovery_job(
         return RecoveryJobResponse(**service.get_job(job_id).__dict__)
     except KeyError:
         return JSONResponse(status_code=404, content={"error": "job_not_found"})
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
+
+
+@app.post("/api/v1/agent/sessions", response_model=AgentSessionResponse)
+def start_agent_session(
+    service: Annotated[AgentService, Depends(get_agent_service)],
+) -> AgentSessionResponse | JSONResponse:
+    try:
+        return AgentSessionResponse(**service.start_session().__dict__)
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
+
+
+@app.get("/api/v1/agent/sessions/{session_id}", response_model=AgentSessionResponse)
+def get_agent_session(
+    session_id: str,
+    service: Annotated[AgentService, Depends(get_agent_service)],
+) -> AgentSessionResponse | JSONResponse:
+    try:
+        return AgentSessionResponse(**service.get_session(session_id).__dict__)
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "agent_session_not_found"})
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
+
+
+@app.post("/api/v1/agent/sessions/{session_id}/messages", response_model=AgentMessageResponse)
+def agent_message(
+    session_id: str,
+    request: AgentMessageRequest,
+    service: Annotated[AgentService, Depends(get_agent_service)],
+) -> AgentMessageResponse | JSONResponse:
+    try:
+        return _agent_response(service.dispatch(session_id, request.intent, request.subject_id))
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "agent_subject_not_found"})
+    except ImpactScopeExceeded as exc:
+        return JSONResponse(
+            status_code=413, content={"error": "impact_scope_exceeded", "message": str(exc)}
+        )
     except LineageGraphError:
         return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
