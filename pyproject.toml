@@ -1,0 +1,41 @@
+[project]
+name = "benchwitness"
+version = "0.1.0"
+description = "Graph-native ML evaluation integrity"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "falkordb>=1.0,<3",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[project.scripts]
+benchwitness-graph-health = "benchwitness_api.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["apps/api/benchwitness_api"]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.27,<1",
+  "mypy>=1.11,<2",
+  "pytest>=8,<10",
+  "ruff>=0.7,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["apps/api/tests"]
+markers = ["integration: requires a running FalkorDB service"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["apps/api/benchwitness_api", "apps/api/tests"]
+strict = true
