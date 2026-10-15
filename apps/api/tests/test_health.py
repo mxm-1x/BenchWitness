@@ -1,5 +1,6 @@
 """HTTP smoke and failure-state tests."""
 
+import pytest
 from benchwitness_api.graph import GraphUnavailable
 from benchwitness_api.graph_lineage import AuditEvidence, AuditResult
 from benchwitness_api.main import (
@@ -62,6 +63,20 @@ def test_healthz_smoke() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_api_post_requires_configured_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCHWITNESS_API_TOKEN", "test-token-" + "x" * 40)
+    response = TestClient(app).post("/api/v1/demo/seed")
+    assert response.status_code == 401
+    assert response.json()["error"] == "unauthorized"
+
+
+def test_api_post_is_disabled_without_token_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BENCHWITNESS_API_TOKEN", raising=False)
+    response = TestClient(app).post("/api/v1/demo/seed")
+    assert response.status_code == 503
+    assert response.json()["error"] == "api_auth_not_configured"
+
+
 def test_readyz_reports_graph_failure() -> None:
     app.dependency_overrides[get_graph_probe] = lambda: UnavailableProbe()
     try:
@@ -72,12 +87,17 @@ def test_readyz_reports_graph_failure() -> None:
     assert response.json() == {"status": "not_ready", "graph": "unreachable"}
 
 
-def test_seed_and_lineage_audit_api_smoke() -> None:
+def test_seed_and_lineage_audit_api_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
+    api_token = "smoke-test-token-" + "x" * 40
+    monkeypatch.setenv("BENCHWITNESS_API_TOKEN", api_token)
     app.dependency_overrides[get_demo_seed_service] = lambda: SmokeSeedService()
     app.dependency_overrides[get_graph_lineage_store] = lambda: SmokeLineageStore()
     try:
         client = TestClient(app)
-        seed = client.post("/api/v1/demo/seed")
+        seed = client.post(
+            "/api/v1/demo/seed",
+            headers={"Authorization": f"Bearer {api_token}"},
+        )
         audit = client.get("/api/v1/experiments/demo-contaminated-a/lineage-audit")
     finally:
         app.dependency_overrides.clear()

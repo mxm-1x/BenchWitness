@@ -10,6 +10,7 @@ from benchwitness_api.graph_lineage import (
     ActionNotAllowed,
     AuditEvidence,
     AuditResult,
+    ExperimentRunRecord,
     GraphLineageStore,
     ImpactedRunRecord,
     ImpactEvidenceRecord,
@@ -30,10 +31,10 @@ class ImpactService:
         candidates = self._graph.list_source_family_runs(source_record_id)
         audit_cache: dict[str, AuditResult] = {}
         unresolved: set[str] = set()
-        impacted_runs: list[ImpactedRunRecord] = []
+        verified_runs: list[tuple[ExperimentRunRecord, tuple[AuditEvidence, ...]]] = []
         evidence_path_count = 0
 
-        for index, candidate in enumerate(candidates):
+        for candidate in candidates:
             try:
                 run = self._graph.get_run(candidate.run_id)
             except KeyError:
@@ -75,15 +76,18 @@ class ImpactService:
                 unresolved.add(candidate.run_id)
                 continue
             if evidence_path_count + len(source_evidence) > 1_000:
-                unresolved.update(item.run_id for item in candidates[index:])
                 raise ImpactScopeExceeded(
                     "source overlap evidence exceeds the 1,000-path investigation limit"
                 )
+            evidence_path_count += len(source_evidence)
+            verified_runs.append((run, source_evidence))
 
+        # Check the full response bound before creating any projected claim nodes.
+        impacted_runs: list[ImpactedRunRecord] = []
+        for run, source_evidence in verified_runs:
             model_configuration_id, evaluation_claim_id, metrics = (
                 self._graph.materialize_run_claims(run)
             )
-            evidence_path_count += len(source_evidence)
             impacted_runs.append(
                 ImpactedRunRecord(
                     run_id=run.run_id,

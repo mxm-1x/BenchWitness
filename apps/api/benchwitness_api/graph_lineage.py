@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ _MAX_EVIDENCE_PATHS = 100
 _MAX_DATASET_SAMPLES = 1_000
 _MAX_IMPACT_RUNS = 100
 _MAX_IMPACT_ROWS = 1_000
+_LOGGER = logging.getLogger(__name__)
 
 _UPSERT_SOURCES = """
 UNWIND $rows AS row
@@ -175,11 +177,20 @@ RETURN run.id, experiment.id, training.id, evaluation.id, run.model_id,
 LIMIT 1
 """
 _GET_SOURCE_FAMILY_RUNS = """
-MATCH (source:SourceRecord {id: $source_record_id})
 MATCH (run:ExperimentRun)-[:TRAINED_ON]->(training:DatasetVersion)
 MATCH (run)-[:EVALUATED_ON]->(evaluation:DatasetVersion)
-WHERE training.source_family_id = source.family_id
-   OR evaluation.source_family_id = source.family_id
+WHERE training.source_family_id = $source_family_id
+   OR evaluation.source_family_id = $source_family_id
+RETURN DISTINCT run.id, run.experiment_id, training.id, evaluation.id
+LIMIT $limit
+"""
+_GET_SOURCE_LINEAGE_RUNS = """
+MATCH (source:SourceRecord {id: $source_record_id})
+MATCH (sample:SampleVersion)-[:DERIVED_FROM*1..3]->(source)
+MATCH (dataset:DatasetVersion)-[:CONTAINS]->(sample)
+MATCH (run:ExperimentRun)-[:TRAINED_ON]->(training:DatasetVersion)
+MATCH (run)-[:EVALUATED_ON]->(evaluation:DatasetVersion)
+WHERE dataset.id = training.id OR dataset.id = evaluation.id
 RETURN DISTINCT run.id, run.experiment_id, training.id, evaluation.id
 LIMIT $limit
 """
@@ -237,6 +248,17 @@ SET investigation.status = $status,
     finding.status = $status,
     finding.coverage_complete = $coverage_complete
 RETURN finding.id
+"""
+_DELETE_PARTIAL_INVESTIGATION = """
+MATCH (investigation:Investigation {id: $investigation_id})
+OPTIONAL MATCH (investigation)-[:ESTABLISHED]->(finding:Finding)
+OPTIONAL MATCH (finding)-[:SUPPORTED_BY]->(evidence:LineageEvidence)
+WITH investigation, collect(DISTINCT finding) AS findings,
+     collect(DISTINCT evidence) AS evidence_nodes
+FOREACH (evidence IN evidence_nodes | DETACH DELETE evidence)
+FOREACH (finding IN findings | DETACH DELETE finding)
+DETACH DELETE investigation
+RETURN 1
 """
 _LINK_FINDING_IMPACTS = """
 UNWIND $claim_ids AS claim_id
@@ -803,33 +825,54 @@ class GraphLineageStore:
         )
 
     def list_source_family_runs(self, source_record_id: str) -> list[RunCandidate]:
-        """List bounded candidate runs whose datasets name the source's family."""
+        """List bounded candidates from both the family index and exact lineage."""
         source_rows = self._query(_GET_SOURCE_FAMILY, {"source_record_id": source_record_id})
         if not source_rows:
             raise KeyError(source_record_id)
         if len(source_rows) != 1 or len(source_rows[0]) != 1:
             raise LineageGraphError("FalkorDB returned invalid source family data")
-        rows = self._query(
+        source_family_id = source_rows[0][0]
+        if not isinstance(source_family_id, str) or not source_family_id:
+            raise LineageGraphError("FalkorDB source record has no verified family identifier")
+        family_params = {
+            "source_family_id": source_family_id,
+            "limit": _MAX_IMPACT_RUNS + 1,
+        }
+        lineage_params = {
+            "source_record_id": source_record_id,
+            "limit": _MAX_IMPACT_RUNS + 1,
+        }
+        family_rows = self._query(
             _GET_SOURCE_FAMILY_RUNS,
-            {"source_record_id": source_record_id, "limit": _MAX_IMPACT_RUNS + 1},
+            family_params,
         )
-        if len(rows) > _MAX_IMPACT_RUNS:
+        lineage_rows = self._query(_GET_SOURCE_LINEAGE_RUNS, lineage_params)
+        if len(family_rows) > _MAX_IMPACT_RUNS or len(lineage_rows) > _MAX_IMPACT_RUNS:
             raise ImpactScopeExceeded(
                 f"source family exceeds the {_MAX_IMPACT_RUNS}-run impact limit"
             )
-        candidates: list[RunCandidate] = []
-        for row in rows:
+        candidates_by_key: dict[tuple[str, str, str, str], RunCandidate] = {}
+        for row in [*family_rows, *lineage_rows]:
             if len(row) != 4:
                 raise LineageGraphError("FalkorDB returned invalid impact candidate data")
-            candidates.append(
-                RunCandidate(
-                    run_id=str(row[0]),
-                    experiment_id=str(row[1]),
-                    training_dataset_id=str(row[2]),
-                    evaluation_dataset_id=str(row[3]),
-                )
+            candidate = RunCandidate(
+                run_id=str(row[0]),
+                experiment_id=str(row[1]),
+                training_dataset_id=str(row[2]),
+                evaluation_dataset_id=str(row[3]),
             )
-        return candidates
+            key = (
+                candidate.run_id,
+                candidate.experiment_id,
+                candidate.training_dataset_id,
+                candidate.evaluation_dataset_id,
+            )
+            candidates_by_key[key] = candidate
+        if len(candidates_by_key) > _MAX_IMPACT_RUNS:
+            raise ImpactScopeExceeded(
+                f"source family exceeds the {_MAX_IMPACT_RUNS}-run impact limit"
+            )
+        return [candidates_by_key[key] for key in sorted(candidates_by_key)]
 
     def materialize_run_claims(
         self, run: ExperimentRunRecord
@@ -871,68 +914,81 @@ class GraphLineageStore:
     def record_impact_investigation(self, investigation: ImpactInvestigationRecord) -> None:
         """Append a finding, exact evidence paths and run-claim impact edges."""
         finding_id = f"finding:{investigation.investigation_id}"
-        rows = self._query(
-            _RECORD_INVESTIGATION,
-            {
-                "investigation_id": investigation.investigation_id,
-                "finding_id": finding_id,
-                "source_record_id": investigation.source_record_id,
-                "created_at": investigation.created_at,
-            },
-        )
-        if rows != [[finding_id]]:
-            raise LineageGraphError("FalkorDB did not create the investigation record")
-
-        claim_ids = sorted({run.evaluation_claim_id for run in investigation.impacted_runs})
-        if claim_ids:
-            link_rows = self._query(
-                _LINK_FINDING_IMPACTS, {"finding_id": finding_id, "claim_ids": claim_ids}
+        try:
+            rows = self._query(
+                _RECORD_INVESTIGATION,
+                {
+                    "investigation_id": investigation.investigation_id,
+                    "finding_id": finding_id,
+                    "source_record_id": investigation.source_record_id,
+                    "created_at": investigation.created_at,
+                },
             )
-            if link_rows != [[len(claim_ids)]]:
-                raise LineageGraphError("FalkorDB did not link all impacted evaluation claims")
+            if rows != [[finding_id]]:
+                raise LineageGraphError("FalkorDB did not create the investigation record")
 
-        evidence_rows: list[dict[str, Any]] = []
-        for impacted_run in investigation.impacted_runs:
-            for evidence in impacted_run.evidence:
-                evidence_key = (
-                    f"{investigation.investigation_id}\0{evidence.run_id}"
-                    f"\0{evidence.canonical_source_record_id}\0{evidence.training_sample_id}"
-                    f"\0{evidence.evaluation_sample_id}"
+            claim_ids = sorted({run.evaluation_claim_id for run in investigation.impacted_runs})
+            if claim_ids:
+                link_rows = self._query(
+                    _LINK_FINDING_IMPACTS, {"finding_id": finding_id, "claim_ids": claim_ids}
                 )
-                evidence_rows.append(
-                    {
-                        "id": f"evidence:{hashlib.sha256(evidence_key.encode()).hexdigest()}",
-                        "run_id": evidence.run_id,
-                        "source_record_id": evidence.canonical_source_record_id,
-                        "training_dataset_id": evidence.training_dataset_id,
-                        "training_sample_id": evidence.training_sample_id,
-                        "training_derivation_hops": evidence.training_derivation_hops,
-                        "evaluation_dataset_id": evidence.evaluation_dataset_id,
-                        "evaluation_sample_id": evidence.evaluation_sample_id,
-                        "evaluation_derivation_hops": evidence.evaluation_derivation_hops,
-                        "evaluation_claim_id": impacted_run.evaluation_claim_id,
-                    }
+                if link_rows != [[len(claim_ids)]]:
+                    raise LineageGraphError("FalkorDB did not link all impacted evaluation claims")
+
+            evidence_rows: list[dict[str, Any]] = []
+            for impacted_run in investigation.impacted_runs:
+                for evidence in impacted_run.evidence:
+                    evidence_key = (
+                        f"{investigation.investigation_id}\0{evidence.run_id}"
+                        f"\0{evidence.canonical_source_record_id}\0{evidence.training_sample_id}"
+                        f"\0{evidence.evaluation_sample_id}"
+                    )
+                    evidence_rows.append(
+                        {
+                            "id": f"evidence:{hashlib.sha256(evidence_key.encode()).hexdigest()}",
+                            "run_id": evidence.run_id,
+                            "source_record_id": evidence.canonical_source_record_id,
+                            "training_dataset_id": evidence.training_dataset_id,
+                            "training_sample_id": evidence.training_sample_id,
+                            "training_derivation_hops": evidence.training_derivation_hops,
+                            "evaluation_dataset_id": evidence.evaluation_dataset_id,
+                            "evaluation_sample_id": evidence.evaluation_sample_id,
+                            "evaluation_derivation_hops": evidence.evaluation_derivation_hops,
+                            "evaluation_claim_id": impacted_run.evaluation_claim_id,
+                        }
+                    )
+            for offset in range(0, len(evidence_rows), _WRITE_BATCH_SIZE):
+                batch = evidence_rows[offset : offset + _WRITE_BATCH_SIZE]
+                evidence_result = self._query(
+                    _RECORD_EVIDENCE_PATHS, {"finding_id": finding_id, "rows": batch}
                 )
-        for offset in range(0, len(evidence_rows), _WRITE_BATCH_SIZE):
-            batch = evidence_rows[offset : offset + _WRITE_BATCH_SIZE]
-            evidence_result = self._query(
-                _RECORD_EVIDENCE_PATHS, {"finding_id": finding_id, "rows": batch}
+                if evidence_result != [[len(batch)]]:
+                    raise LineageGraphError("FalkorDB did not persist all impact evidence paths")
+
+            finalized = self._query(
+                _FINALIZE_INVESTIGATION,
+                {
+                    "investigation_id": investigation.investigation_id,
+                    "finding_id": finding_id,
+                    "status": investigation.finding_status,
+                    "coverage_complete": investigation.coverage_complete,
+                    "unresolved_run_ids": list(investigation.unresolved_run_ids),
+                },
             )
-            if evidence_result != [[len(batch)]]:
-                raise LineageGraphError("FalkorDB did not persist all impact evidence paths")
-
-        finalized = self._query(
-            _FINALIZE_INVESTIGATION,
-            {
-                "investigation_id": investigation.investigation_id,
-                "finding_id": finding_id,
-                "status": investigation.finding_status,
-                "coverage_complete": investigation.coverage_complete,
-                "unresolved_run_ids": list(investigation.unresolved_run_ids),
-            },
-        )
-        if finalized != [[finding_id]]:
-            raise LineageGraphError("FalkorDB did not finalize the investigation")
+            if finalized != [[finding_id]]:
+                raise LineageGraphError("FalkorDB did not finalize the investigation")
+        except Exception:
+            try:
+                self._query(
+                    _DELETE_PARTIAL_INVESTIGATION,
+                    {"investigation_id": investigation.investigation_id},
+                )
+            except LineageGraphError:
+                _LOGGER.exception(
+                    "Failed to clean up partial impact investigation %s",
+                    investigation.investigation_id,
+                )
+            raise
 
     def get_investigation(self, investigation_id: str) -> ImpactInvestigationRecord:
         """Read a persisted bounded impact report and its derived quarantine state."""

@@ -24,6 +24,9 @@ Run from the repository root:
 
 ```sh
 cp .env.example .env
+openssl rand -hex 32
+# Paste the generated value into BENCHWITNESS_API_TOKEN in .env.
+# Set BENCHWITNESS_APPROVER to the local reviewer's audit label.
 set -a
 source .env
 set +a
@@ -62,10 +65,10 @@ With FalkorDB running, seed the deterministic 400-row synthetic source, split ma
 uv run benchwitness-seed-demo
 ```
 
-The command writes source rows and manifests under `artifacts/demo/` (ignored by Git) and idempotently merges the lineage graph. It uses no external dataset, paid API, or hosted service. You can also seed through the API after starting Uvicorn:
+The command writes source rows and manifests under `artifacts/demo/` (ignored by Git) and idempotently merges the lineage graph. It uses no external dataset, paid API, or hosted service. Every API `POST` requires the bearer token configured in `.env`; read-only health and audit requests do not. You can also seed through the API after starting Uvicorn:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8000/api/v1/demo/seed
+curl -sS -X POST http://127.0.0.1:8000/api/v1/demo/seed -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN"
 curl -sS http://127.0.0.1:8000/api/v1/experiments/demo-contaminated-a/lineage-audit
 ```
 
@@ -85,26 +88,26 @@ These are measured results on the included synthetic scenario, not a promise tha
 
 ## Trace impact and quarantine a result
 
-Use the `canonical_source_record_id` from a confirmed lineage audit. The investigation checks runs in that source family, verifies their recorded dataset pair, and returns exact training/evaluation sample paths with the model configuration, evaluation claim, and measured metric claims. If a candidate run cannot be verified, the report marks its scope incomplete and quarantine is disabled.
+Use the `canonical_source_record_id` from a confirmed lineage audit. The investigation checks both the source-family index and actual sample ancestry paths, so a missing or stale family label cannot hide a run with recorded lineage to that source. It verifies each candidate's recorded dataset pair and returns exact training/evaluation sample paths with the model configuration, evaluation claim, and measured metric claims. If a candidate run cannot be verified, the report marks its scope incomplete and quarantine is disabled.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8000/api/v1/impact -H 'Content-Type: application/json' -d '{"source_record_id":"<canonical_source_record_id-from-audit>"}'
+curl -sS -X POST http://127.0.0.1:8000/api/v1/impact -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN" -H 'Content-Type: application/json' -d '{"source_record_id":"<canonical_source_record_id-from-audit>"}'
 ```
 
 The response includes an `investigation_id`. A quarantine proposal names the exact affected evaluation claim IDs and remains `proposed`; those claims and metrics are unchanged:
 
 ```sh
-curl -sS -X POST "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>/quarantine-proposals" -H 'Content-Type: application/json' -d '{"reason":"Confirmed sample-level train/evaluation overlap"}'
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>/quarantine-proposals" -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN" -H 'Content-Type: application/json' -d '{"reason":"Confirmed sample-level train/evaluation overlap"}'
 ```
 
-Only a separate explicit approval request appends the approval decision. Supply the `action_id` returned by the proposal and a reviewer label and reason:
+Only a separate explicit approval request appends the approval decision. Supply the `action_id` returned by the proposal and a reason. The approver identity comes from `BENCHWITNESS_APPROVER`, configured alongside the bearer token:
 
 ```sh
-curl -sS -X POST "http://127.0.0.1:8000/api/v1/actions/<action_id>/approve" -H 'Content-Type: application/json' -d '{"approver":"local-reviewer","reason":"I reviewed the source and sample evidence"}'
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/actions/<action_id>/approve" -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN" -H 'Content-Type: application/json' -d '{"reason":"I reviewed the source and sample evidence"}'
 curl -sS "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>"
 ```
 
-The investigation then reports those claims as `quarantined` by following the approved decision edge. Original run records, evaluation claims, and metric values remain stored unchanged. These endpoints are for the local demo; do not expose mutation endpoints publicly without authentication.
+The investigation then reports those claims as `quarantined` by following the approved decision edge. Original run records, evaluation claims, and metric values remain stored unchanged. The local bearer token guards every API `POST`, and the configured approver label is recorded with approval. This is a single-reviewer local gate; do not expose the API publicly without deployment-grade authentication and authorization.
 
 The graph represents a measured run as `ExperimentRun -[:USES_MODEL_CONFIGURATION]-> ModelConfiguration`, `ExperimentRun -[:HAS_EVALUATION]-> EvaluationClaim`, and `EvaluationClaim -[:REPORTS]-> MetricClaim`. An `Investigation` establishes a `Finding`; the finding points to exact `LineageEvidence` paths and impacted evaluation claims. `ActionProposal -[:TARGETS]-> EvaluationClaim` records proposed scope, while `ApprovalDecision -[:APPROVES]-> ActionProposal` records explicit approval.
 

@@ -1,12 +1,16 @@
 """Minimal process and FalkorDB readiness endpoints."""
 
+import hmac
+import os
+from collections.abc import Awaitable, Callable
 from functools import lru_cache
 from typing import Annotated, Literal
 
 from benchwitness_ml.runner import DemoEvaluationRunner, EvaluationBlocked
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.responses import Response
 
 from benchwitness_api.demo_seed import DemoSeedService, artifact_directory_from_env
 from benchwitness_api.graph import GraphProbe, GraphUnavailable
@@ -141,7 +145,6 @@ class QuarantineProposalRequest(BaseModel):
 
 
 class QuarantineApprovalRequest(BaseModel):
-    approver: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=1, max_length=500)
 
 
@@ -184,6 +187,47 @@ def get_impact_service() -> ImpactService:
 
 
 app = FastAPI(title="BenchWitness API", version="0.1.0")
+
+
+@app.middleware("http")
+async def authenticate_api_mutations(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Require a configured local bearer token for every API POST request."""
+    if request.method == "POST" and request.url.path.startswith("/api/"):
+        expected_token = os.environ.get("BENCHWITNESS_API_TOKEN", "")
+        if len(expected_token) < 32:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "api_auth_not_configured",
+                    "message": "Set BENCHWITNESS_API_TOKEN to a random value of at least 32 characters",
+                },
+            )
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, supplied_token = authorization.partition(" ")
+        if (
+            scheme.lower() != "bearer"
+            or not separator
+            or not hmac.compare_digest(supplied_token, expected_token)
+        ):
+            return JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                content={"error": "unauthorized", "message": "A valid bearer token is required"},
+            )
+    return await call_next(request)
+
+
+def get_approval_identity() -> str:
+    """Return the locally configured identity bound to the API bearer token."""
+    approver = os.environ.get("BENCHWITNESS_APPROVER", "").strip()
+    if not approver:
+        raise HTTPException(
+            status_code=503,
+            detail="Set BENCHWITNESS_APPROVER to the reviewer identity associated with the token",
+        )
+    return approver
 
 
 def _impact_response(record: ImpactInvestigationRecord) -> ImpactInvestigationResponse:
@@ -394,10 +438,11 @@ def propose_quarantine(
 def approve_quarantine(
     action_id: str,
     request: QuarantineApprovalRequest,
+    approver: Annotated[str, Depends(get_approval_identity)],
     service: Annotated[ImpactService, Depends(get_impact_service)],
 ) -> QuarantineActionResponse | JSONResponse:
     try:
-        action = service.approve_quarantine(action_id, request.approver, request.reason)
+        action = service.approve_quarantine(action_id, approver, request.reason)
         return _quarantine_action_response(action)
     except KeyError:
         return JSONResponse(

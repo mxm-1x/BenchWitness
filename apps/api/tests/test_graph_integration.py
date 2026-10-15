@@ -3,12 +3,13 @@
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from benchwitness_api.demo_seed import DemoSeedService
 from benchwitness_api.graph import GraphProbe
-from benchwitness_api.graph_lineage import GraphLineageStore
+from benchwitness_api.graph_lineage import GraphLineageStore, LineageGraphError
 from benchwitness_api.impact import ImpactService
 from benchwitness_api.main import (
     app,
@@ -29,7 +30,13 @@ def test_graph_query_reaches_real_falkordb() -> None:
 
 
 @pytest.mark.integration
-def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: Path) -> None:
+def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api_token = "integration-test-token-" + "x" * 40
+    monkeypatch.setenv("BENCHWITNESS_API_TOKEN", api_token)
+    monkeypatch.setenv("BENCHWITNESS_APPROVER", "integration-test-reviewer")
+    auth_headers = {"Authorization": f"Bearer {api_token}"}
     settings = GraphSettings.from_env()
     test_graph_name = f"bw_m2_{uuid4().hex[:12]}"
     test_settings = GraphSettings(settings.host, settings.port, test_graph_name)
@@ -47,7 +54,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         )
         app.dependency_overrides[get_impact_service] = lambda: ImpactService(store)
         client = TestClient(app)
-        seeded = client.post("/api/v1/demo/seed")
+        seeded = client.post("/api/v1/demo/seed", headers=auth_headers)
         assert seeded.status_code == 200
         assert seeded.json()["source_records_processed"] == 400
         api_audit = client.get("/api/v1/experiments/demo-contaminated-a/lineage-audit")
@@ -56,7 +63,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         assert api_audit.json()["coverage_complete"]
         assert api_audit.json()["source_artifact_verified"]
 
-        evaluation_response = client.post("/api/v1/demo/evaluate")
+        evaluation_response = client.post("/api/v1/demo/evaluate", headers=auth_headers)
         assert evaluation_response.status_code == 200
         runs = evaluation_response.json()["runs"]
         assert {run["experiment_id"] for run in runs} == {
@@ -128,7 +135,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
                 run["f1"],
             )
 
-        repeated_evaluation = client.post("/api/v1/demo/evaluate")
+        repeated_evaluation = client.post("/api/v1/demo/evaluate", headers=auth_headers)
         assert repeated_evaluation.status_code == 200
         repeated_metrics = {
             run["experiment_id"]: (
@@ -179,7 +186,78 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         assert unknown.evidence == ()
 
         source_record_id = audit_a.evidence[0].canonical_source_record_id
-        impact_response = client.post("/api/v1/impact", json={"source_record_id": source_record_id})
+
+        # The exact lineage traversal must still find affected runs when both
+        # denormalized dataset family labels are missing or stale.
+        stale_dataset_ids = {
+            "dataset:train-contaminated-a-v1",
+            "dataset:eval-v1",
+        }
+        for dataset_id in stale_dataset_ids:
+            graph.query(
+                "MATCH (dataset:DatasetVersion {id: $dataset_id}) "
+                "SET dataset.source_family_id = $stale_family",
+                params={"dataset_id": dataset_id, "stale_family": "stale-family-index"},
+            )
+        try:
+            candidates_with_stale_index = store.list_source_family_runs(source_record_id)
+            stale_a_run_ids = {
+                run["run_id"] for run in runs if run["experiment_id"] == "demo-contaminated-a"
+            }
+            assert stale_a_run_ids <= {
+                candidate.run_id for candidate in candidates_with_stale_index
+            }
+            stale_impact_response = client.post(
+                "/api/v1/impact",
+                json={"source_record_id": source_record_id},
+                headers=auth_headers,
+            )
+            assert stale_impact_response.status_code == 200
+            assert stale_impact_response.json()["finding_status"] == "unknown"
+            assert not stale_impact_response.json()["coverage_complete"]
+        finally:
+            for dataset_id in stale_dataset_ids:
+                graph.query(
+                    "MATCH (dataset:DatasetVersion {id: $dataset_id}) "
+                    "SET dataset.source_family_id = $source_family",
+                    params={
+                        "dataset_id": dataset_id,
+                        "source_family": "synthetic-classification-v1",
+                    },
+                )
+
+        # A failed evidence write removes its partial finding and investigation.
+        original_query = store._query
+        fail_evidence_once = True
+        graph_counts_before_failure = {
+            label: graph.query(f"MATCH (item:{label}) RETURN count(item)").result_set[0][0]
+            for label in ("Investigation", "Finding", "LineageEvidence")
+        }
+
+        def fail_one_evidence_query(
+            query: str, params: dict[str, Any] | None = None
+        ) -> list[list[Any]]:
+            nonlocal fail_evidence_once
+            if "MERGE (finding)-[:SUPPORTED_BY]->(evidence)" in query and fail_evidence_once:
+                fail_evidence_once = False
+                original_query(query, params)
+                raise LineageGraphError("injected evidence write failure")
+            return original_query(query, params)
+
+        store._query = fail_one_evidence_query  # type: ignore[method-assign]
+        try:
+            with pytest.raises(LineageGraphError, match="injected evidence write failure"):
+                ImpactService(store).investigate_source(source_record_id)
+        finally:
+            store._query = original_query  # type: ignore[method-assign]
+        for label, count in graph_counts_before_failure.items():
+            assert graph.query(f"MATCH (item:{label}) RETURN count(item)").result_set == [[count]]
+
+        impact_response = client.post(
+            "/api/v1/impact",
+            json={"source_record_id": source_record_id},
+            headers=auth_headers,
+        )
         assert impact_response.status_code == 200
         impact = impact_response.json()
         assert impact["finding_status"] == "confirmed"
@@ -215,6 +293,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         proposal_response = client.post(
             f"/api/v1/investigations/{impact['investigation_id']}/quarantine-proposals",
             json={"reason": "Confirmed sample-level train/evaluation overlap"},
+            headers=auth_headers,
         )
         assert proposal_response.status_code == 200
         proposal = proposal_response.json()
@@ -232,10 +311,12 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
 
         approval_response = client.post(
             f"/api/v1/actions/{proposal['action_id']}/approve",
-            json={"approver": "integration-test", "reason": "Human approval for demo test"},
+            json={"reason": "Human approval for demo test"},
+            headers=auth_headers,
         )
         assert approval_response.status_code == 200
         assert approval_response.json()["status"] == "approved"
+        assert approval_response.json()["approver"] == "integration-test-reviewer"
         assert set(approval_response.json()["target_claim_ids"]) == claim_ids
 
         quarantined_impact = client.get(f"/api/v1/investigations/{impact['investigation_id']}")
@@ -267,7 +348,9 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
             if row["source_record_id"] != source_record_id
         )
         clean_impact_response = client.post(
-            "/api/v1/impact", json={"source_record_id": clean_source_id}
+            "/api/v1/impact",
+            json={"source_record_id": clean_source_id},
+            headers=auth_headers,
         )
         assert clean_impact_response.status_code == 200
         clean_impact = clean_impact_response.json()
@@ -277,6 +360,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         blocked_proposal = client.post(
             f"/api/v1/investigations/{clean_impact['investigation_id']}/quarantine-proposals",
             json={"reason": "A clean source must not be quarantined"},
+            headers=auth_headers,
         )
         assert blocked_proposal.status_code == 409
 
