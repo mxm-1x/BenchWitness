@@ -1,12 +1,12 @@
 # BenchWitness — dataset inventory and sourcing notes
 
-**Status:** pre-event research only. Do not download, generate, transform, or seed data until **15 October 2026, 00:01 IST** and an explicit human kickoff. The figures below are planning targets, not generated data or measured outcomes.
+**Status:** Milestone 2 implementation. The committed generator creates a 400-row synthetic source with seed `20261015`, stable canonical IDs, a disjoint 300/100 stratified split, five versioned manifests, and four lineage experiments. Rows and manifests are generated locally by `uv run benchwitness-seed-demo`; generated artifacts remain ignored by Git. This milestone contains no trained models or evaluation metrics.
 
 ## Finding: one source dataset is enough
 
-The required demo needs **one small synthetic tabular classification source**, then several *versioned views and manifests derived from it*. It does not need Kaggle, a paid API, or private data. [scikit-learn's `make_classification`](https://scikit-learn.org/stable/modules/generated/sklearn.datasets.make_classification.html) can generate labeled samples with a fixed random state; [stratified `train_test_split`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.train_test_split.html) can define the initial held-out partition. scikit-learn itself is [BSD-3-Clause licensed](https://github.com/scikit-learn/scikit-learn). The [hackathon rules](https://www.wemakedevs.org/hackathons/falkordb/rules) permit synthetic data.
+The required demo needs **one small synthetic tabular classification source**, then several *versioned views and manifests derived from it*. It does not need Kaggle, a paid API, or private data. The current generator uses Python's standard library: fixed-seed feature vectors with a deterministic binary label and a stratified split. The [hackathon rules](https://www.wemakedevs.org/hackathons/falkordb/rules) permit synthetic data.
 
-Generate this source **during the event** with a committed recipe, fixed seed, pinned package version, and recorded feature/label schema. An illustrative scale is 400–800 rows and a 75/25 stratified train/evaluation split; choose the exact shape after timing the MacBook. Assign each source row a stable opaque ID from the recipe/version and row index. Keep IDs separate from feature-content hashes: equal feature values alone do not prove that two rows are the same source record.
+The recipe is `benchwitness_api.lineage.build_demo_scenario`: 400 rows, seed `20261015`, two numeric features, binary label, and a 75/25 stratified split. It assigns stable IDs such as `source:synthetic-v1:0000`. Keep IDs separate from feature-content hashes: equal feature values alone do not prove that two rows are the same source record. The source file, split, and five manifests are written under ignored `artifacts/demo/`; the graph stores identities, manifest hashes, sample memberships, and derivation edges.
 
 ## Required logical datasets and fixtures
 
@@ -48,4 +48,4 @@ Avoid tuning algorithms, feature transforms, copied-ID selection, or hyperparame
 - Original and repaired metrics are generated from real predictions; no expected score or job success is inserted as fixture data.
 - Generated or optional public data comply with the event rules; no private, login-protected, personal, or restricted dataset enters the graph.
 
-No files or rows described here exist yet. They are the dataset plan for the event-time implementation and must be verified once created.
+The seed command creates the rows and manifests reproducibly. The real-FalkorDB integration test verifies two confirmed paths for the shared leaked source, a clean same-family control, missing ancestry as `unknown`, and manifest drift preventing a complete clean result. Training and measured scores remain Milestone 3 work.

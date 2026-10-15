@@ -1,6 +1,6 @@
 # BenchWitness — phase and GitHub delivery plan
 
-**Pre-event planning note only.** Do not initialize or scaffold the implementation, create implementation commits, or publish the working project until **15 October 2026, 00:01 IST** and an explicit human kickoff. The current notes directory is not yet a Git repository. This plan complements [PROJECT_BLUEPRINT.md](PROJECT_BLUEPRINT.md), [PRE_EVENT_STRATEGY.md](PRE_EVENT_STRATEGY.md), and the first [kickoff prompt](CODEX_KICKOFF_PROMPT.md).
+**Live delivery plan, updated 15 October 2026.** Milestone 1 is complete; Milestone 2 lineage code and its local checks are implemented and awaiting the milestone gate. This plan complements [PROJECT_BLUEPRINT.md](PROJECT_BLUEPRINT.md), [PRE_EVENT_STRATEGY.md](PRE_EVENT_STRATEGY.md), and the first [kickoff prompt](CODEX_KICKOFF_PROMPT.md).
 
 The data inputs and controls for Phases 2–5 are listed in [DATASET_INVENTORY.md](DATASET_INVENTORY.md).
 
@@ -29,7 +29,7 @@ Every gate means: run checks, review the diff, commit, push, verify the GitHub S
 | Phase | Target | Build slice after kickoff | Acceptance gate | Planned commit(s) |
 |---|---|---|---|---|
 | 1. Foundation | Oct 15 | Repo layout; `uv`; Vite/TypeScript; Compose with **separate** FalkorDB and Redis; API `/healthz` and `/readyz`; graph reachability CLI; `.env.example`; macOS commands | Real FalkorDB integration test, API smoke test, lint/type/build checks pass; local start works | `chore: establish local runtime and quality gates`; `feat(api): report graph readiness` |
-| 2. Lineage | Oct 15 | Synthetic manifest, stable canonical source IDs, sample derivation and dataset membership ingestion in FalkorDB | One contaminated source is confirmed by two membership paths; same-family disjoint control is not confirmed; missing provenance is unknown | `feat(graph): ingest versioned sample lineage`; `feat(audit): prove exact source overlap` |
+| 2. Lineage | Oct 15 | Deterministic synthetic manifests, stable canonical source IDs, sample derivation and dataset membership ingestion in FalkorDB | One source is confirmed in both contaminated experiments; same-family disjoint control is clean only with verified manifest/count/hash coverage; missing provenance is unknown | `feat(graph): ingest versioned sample lineage`; `feat(audit): prove exact source overlap` |
 | 3. Real experiments | Oct 16 | Small CPU-only training/evaluation runs, immutable artifacts and checksums, actual run-to-dataset edges | Scores come from predictions; rerun with same seed is reproducible within documented tolerance; graph points to exact consumed manifests | `feat(ml): record measured experiment versions` |
 | 4. Impact and approval | Oct 16 | Traversal from a finding through model/evaluation/metric dependencies; quarantine proposal and explicit approval | All and only dependent claims appear; without approval no mutation occurs; originals remain | `feat(impact): trace affected evaluation claims`; `feat(actions): require approval for quarantine` |
 | 5. Clean recovery | Oct 16–17 | Separate Redis-backed job; clean split reconstruction; refit and re-evaluation; appended model/evaluation versions | Approved job reaches a measured outcome; duplicate request is idempotent; failure is visible; old versions remain queryable | `feat(worker): run approved clean re-evaluation` |
