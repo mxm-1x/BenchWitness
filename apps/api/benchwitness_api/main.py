@@ -6,14 +6,18 @@ from typing import Annotated, Literal
 from benchwitness_ml.runner import DemoEvaluationRunner, EvaluationBlocked
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from benchwitness_api.demo_seed import DemoSeedService, artifact_directory_from_env
 from benchwitness_api.graph import GraphProbe, GraphUnavailable
 from benchwitness_api.graph_lineage import (
     GraphLineageStore,
+    ImpactInvestigationRecord,
+    ImpactScopeExceeded,
     LineageGraphError,
+    QuarantineActionRecord,
 )
+from benchwitness_api.impact import ActionNotAllowed, ImpactService
 from benchwitness_api.settings import GraphSettings
 
 
@@ -88,6 +92,72 @@ class DemoEvaluationResponse(BaseModel):
     runs: list[ExperimentRunResponse]
 
 
+class ImpactRequest(BaseModel):
+    source_record_id: str = Field(min_length=1, max_length=200)
+
+
+class MetricClaimResponse(BaseModel):
+    claim_id: str
+    name: str
+    value: float
+
+
+class ImpactEvidenceResponse(BaseModel):
+    run_id: str
+    canonical_source_record_id: str
+    training_dataset_id: str
+    training_sample_id: str
+    training_derivation_hops: int
+    evaluation_dataset_id: str
+    evaluation_sample_id: str
+    evaluation_derivation_hops: int
+
+
+class ImpactedRunResponse(BaseModel):
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    model_id: str
+    model_configuration_id: str
+    evaluation_claim_id: str
+    integrity_status: Literal["suspect", "quarantined"]
+    metrics: list[MetricClaimResponse]
+    evidence: list[ImpactEvidenceResponse]
+
+
+class ImpactInvestigationResponse(BaseModel):
+    investigation_id: str
+    source_record_id: str
+    created_at: str
+    finding_status: Literal["confirmed", "clean_within_recorded_lineage", "unknown"]
+    coverage_complete: bool
+    unresolved_run_ids: list[str]
+    impacted_runs: list[ImpactedRunResponse]
+
+
+class QuarantineProposalRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class QuarantineApprovalRequest(BaseModel):
+    approver: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class QuarantineActionResponse(BaseModel):
+    action_id: str
+    investigation_id: str
+    status: Literal["proposed", "approved"]
+    reason: str
+    created_at: str
+    target_claim_ids: list[str]
+    approval_id: str | None
+    approver: str | None
+    approval_reason: str | None
+    approved_at: str | None
+
+
 @lru_cache(maxsize=1)
 def get_graph_probe() -> GraphProbe:
     return GraphProbe(GraphSettings.from_env())
@@ -108,7 +178,53 @@ def get_demo_evaluation_runner() -> DemoEvaluationRunner:
     return DemoEvaluationRunner(get_graph_lineage_store(), artifact_directory_from_env())
 
 
+@lru_cache(maxsize=1)
+def get_impact_service() -> ImpactService:
+    return ImpactService(get_graph_lineage_store())
+
+
 app = FastAPI(title="BenchWitness API", version="0.1.0")
+
+
+def _impact_response(record: ImpactInvestigationRecord) -> ImpactInvestigationResponse:
+    return ImpactInvestigationResponse(
+        investigation_id=record.investigation_id,
+        source_record_id=record.source_record_id,
+        created_at=record.created_at,
+        finding_status=record.finding_status,
+        coverage_complete=record.coverage_complete,
+        unresolved_run_ids=list(record.unresolved_run_ids),
+        impacted_runs=[
+            ImpactedRunResponse(
+                run_id=run.run_id,
+                experiment_id=run.experiment_id,
+                training_dataset_id=run.training_dataset_id,
+                evaluation_dataset_id=run.evaluation_dataset_id,
+                model_id=run.model_id,
+                model_configuration_id=run.model_configuration_id,
+                evaluation_claim_id=run.evaluation_claim_id,
+                integrity_status=run.integrity_status,
+                metrics=[MetricClaimResponse(**metric.__dict__) for metric in run.metrics],
+                evidence=[ImpactEvidenceResponse(**item.__dict__) for item in run.evidence],
+            )
+            for run in record.impacted_runs
+        ],
+    )
+
+
+def _quarantine_action_response(action: QuarantineActionRecord) -> QuarantineActionResponse:
+    return QuarantineActionResponse(
+        action_id=action.action_id,
+        investigation_id=action.investigation_id,
+        status=action.status,
+        reason=action.reason,
+        created_at=action.created_at,
+        target_claim_ids=list(action.target_claim_ids),
+        approval_id=action.approval_id,
+        approver=action.approver,
+        approval_reason=action.approval_reason,
+        approved_at=action.approved_at,
+    )
 
 
 @app.get("/healthz", response_model=HealthStatus)
@@ -191,3 +307,110 @@ def evaluate_demo(
             content={"error": "graph_unavailable", "message": "FalkorDB evaluation failed"},
         )
     return DemoEvaluationResponse(runs=[ExperimentRunResponse(**run.__dict__) for run in runs])
+
+
+@app.post("/api/v1/impact", response_model=ImpactInvestigationResponse)
+def investigate_impact(
+    request: ImpactRequest,
+    service: Annotated[ImpactService, Depends(get_impact_service)],
+) -> ImpactInvestigationResponse | JSONResponse:
+    try:
+        return _impact_response(service.investigate_source(request.source_record_id))
+    except KeyError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "source_record_not_found",
+                "source_record_id": request.source_record_id,
+            },
+        )
+    except ImpactScopeExceeded as exc:
+        return JSONResponse(
+            status_code=413,
+            content={"error": "impact_scope_exceeded", "message": str(exc)},
+        )
+    except LineageGraphError:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "impact_unavailable", "message": "FalkorDB impact query failed"},
+        )
+
+
+@app.get(
+    "/api/v1/investigations/{investigation_id}",
+    response_model=ImpactInvestigationResponse,
+)
+def get_investigation(
+    investigation_id: str,
+    service: Annotated[ImpactService, Depends(get_impact_service)],
+) -> ImpactInvestigationResponse | JSONResponse:
+    try:
+        return _impact_response(service.get_investigation(investigation_id))
+    except KeyError:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "investigation_not_found", "investigation_id": investigation_id},
+        )
+    except LineageGraphError:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "impact_unavailable", "message": "FalkorDB impact query failed"},
+        )
+
+
+@app.post(
+    "/api/v1/investigations/{investigation_id}/quarantine-proposals",
+    response_model=QuarantineActionResponse,
+)
+def propose_quarantine(
+    investigation_id: str,
+    request: QuarantineProposalRequest,
+    service: Annotated[ImpactService, Depends(get_impact_service)],
+) -> QuarantineActionResponse | JSONResponse:
+    try:
+        action = service.propose_quarantine(investigation_id, request.reason)
+        return _quarantine_action_response(action)
+    except KeyError:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "investigation_not_found", "investigation_id": investigation_id},
+        )
+    except ActionNotAllowed as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "quarantine_not_allowed", "message": str(exc)},
+        )
+    except LineageGraphError:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "graph_unavailable",
+                "message": "FalkorDB quarantine proposal failed",
+            },
+        )
+
+
+@app.post("/api/v1/actions/{action_id}/approve", response_model=QuarantineActionResponse)
+def approve_quarantine(
+    action_id: str,
+    request: QuarantineApprovalRequest,
+    service: Annotated[ImpactService, Depends(get_impact_service)],
+) -> QuarantineActionResponse | JSONResponse:
+    try:
+        action = service.approve_quarantine(action_id, request.approver, request.reason)
+        return _quarantine_action_response(action)
+    except KeyError:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "action_not_found", "action_id": action_id},
+        )
+    except ActionNotAllowed as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "quarantine_approval_not_allowed", "message": str(exc)},
+        )
+    except LineageGraphError:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "graph_unavailable", "message": "FalkorDB approval failed"},
+        )

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,6 +23,8 @@ _QUERY_TIMEOUT_MS = 5_000
 _WRITE_BATCH_SIZE = 200
 _MAX_EVIDENCE_PATHS = 100
 _MAX_DATASET_SAMPLES = 1_000
+_MAX_IMPACT_RUNS = 100
+_MAX_IMPACT_ROWS = 1_000
 
 _UPSERT_SOURCES = """
 UNWIND $rows AS row
@@ -170,10 +174,191 @@ RETURN run.id, experiment.id, training.id, evaluation.id, run.model_id,
        run.prediction_sha256, run.manifest_sha256, run.artifact_path
 LIMIT 1
 """
+_GET_SOURCE_FAMILY_RUNS = """
+MATCH (source:SourceRecord {id: $source_record_id})
+MATCH (run:ExperimentRun)-[:TRAINED_ON]->(training:DatasetVersion)
+MATCH (run)-[:EVALUATED_ON]->(evaluation:DatasetVersion)
+WHERE training.source_family_id = source.family_id
+   OR evaluation.source_family_id = source.family_id
+RETURN DISTINCT run.id, run.experiment_id, training.id, evaluation.id
+LIMIT $limit
+"""
+_GET_SOURCE_FAMILY = """
+MATCH (source:SourceRecord {id: $source_record_id})
+RETURN source.family_id
+LIMIT 1
+"""
+_MATERIALIZE_RUN_CLAIMS = """
+MATCH (run:ExperimentRun {id: $run_id})
+MERGE (model:ModelConfiguration {id: $model_configuration_id})
+ON CREATE SET model.model_id = $model_id,
+              model.config_json = $model_config_json
+MERGE (run)-[:USES_MODEL_CONFIGURATION]->(model)
+MERGE (claim:EvaluationClaim {id: $evaluation_claim_id})
+ON CREATE SET claim.run_id = run.id,
+              claim.experiment_id = run.experiment_id,
+              claim.reported_at = run.created_at,
+              claim.source = 'measured_run'
+MERGE (run)-[:HAS_EVALUATION]->(claim)
+WITH run, claim
+UNWIND $metrics AS metric
+MERGE (metric_claim:MetricClaim {id: metric.id})
+ON CREATE SET metric_claim.metric_name = metric.name,
+              metric_claim.value = metric.value,
+              metric_claim.status = 'reported'
+MERGE (claim)-[:REPORTS]->(metric_claim)
+RETURN count(metric_claim)
+"""
+_RECORD_INVESTIGATION = """
+CREATE (investigation:Investigation {
+    id: $investigation_id,
+    source_record_id: $source_record_id,
+    created_at: $created_at,
+    status: 'pending',
+    coverage_complete: false,
+    unresolved_run_ids: []
+})
+CREATE (finding:Finding {
+    id: $finding_id,
+    source_record_id: $source_record_id,
+    status: 'pending',
+    coverage_complete: false,
+    created_at: $created_at
+})
+CREATE (investigation)-[:ESTABLISHED]->(finding)
+RETURN finding.id
+"""
+_FINALIZE_INVESTIGATION = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding {id: $finding_id})
+SET investigation.status = $status,
+    investigation.coverage_complete = $coverage_complete,
+    investigation.unresolved_run_ids = $unresolved_run_ids,
+    finding.status = $status,
+    finding.coverage_complete = $coverage_complete
+RETURN finding.id
+"""
+_LINK_FINDING_IMPACTS = """
+UNWIND $claim_ids AS claim_id
+MATCH (finding:Finding {id: $finding_id})
+MATCH (claim:EvaluationClaim {id: claim_id})
+MERGE (finding)-[:IMPACTS]->(claim)
+RETURN count(claim)
+"""
+_RECORD_EVIDENCE_PATHS = """
+UNWIND $rows AS row
+MATCH (finding:Finding {id: $finding_id})
+MATCH (source:SourceRecord {id: row.source_record_id})
+MATCH (training:DatasetVersion {id: row.training_dataset_id})
+MATCH (training_sample:SampleVersion {id: row.training_sample_id})
+MATCH (evaluation:DatasetVersion {id: row.evaluation_dataset_id})
+MATCH (evaluation_sample:SampleVersion {id: row.evaluation_sample_id})
+MATCH (claim:EvaluationClaim {id: row.evaluation_claim_id})
+MERGE (evidence:LineageEvidence {id: row.id})
+ON CREATE SET evidence.run_id = row.run_id,
+              evidence.canonical_source_record_id = row.source_record_id,
+              evidence.training_derivation_hops = row.training_derivation_hops,
+              evidence.evaluation_derivation_hops = row.evaluation_derivation_hops
+MERGE (finding)-[:SUPPORTED_BY]->(evidence)
+MERGE (evidence)-[:USES_SOURCE]->(source)
+MERGE (evidence)-[:TRAINING_DATASET]->(training)
+MERGE (evidence)-[:TRAINING_SAMPLE]->(training_sample)
+MERGE (evidence)-[:EVALUATION_DATASET]->(evaluation)
+MERGE (evidence)-[:EVALUATION_SAMPLE]->(evaluation_sample)
+MERGE (evidence)-[:RELATES_TO]->(claim)
+RETURN count(evidence)
+"""
+_GET_INVESTIGATION = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding)
+RETURN investigation.id, investigation.source_record_id, investigation.created_at,
+       finding.id, finding.status, finding.coverage_complete,
+       investigation.unresolved_run_ids
+LIMIT 1
+"""
+_GET_IMPACT_METRICS = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding)-[:IMPACTS]->(claim:EvaluationClaim)
+MATCH (run:ExperimentRun)-[:HAS_EVALUATION]->(claim)
+MATCH (run)-[:USES_MODEL_CONFIGURATION]->(model:ModelConfiguration)
+MATCH (claim)-[:REPORTS]->(metric:MetricClaim)
+RETURN run.id, run.experiment_id, run.training_dataset_id, run.evaluation_dataset_id,
+       run.model_id, model.id, claim.id, metric.id, metric.metric_name, metric.value
+LIMIT $limit
+"""
+_GET_IMPACT_EVIDENCE = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding)-[:SUPPORTED_BY]->(evidence:LineageEvidence)
+MATCH (evidence)-[:RELATES_TO]->(claim:EvaluationClaim)
+RETURN evidence.run_id, evidence.canonical_source_record_id,
+       evidence.training_dataset_id, evidence.training_sample_id,
+       evidence.training_derivation_hops, evidence.evaluation_dataset_id,
+       evidence.evaluation_sample_id, evidence.evaluation_derivation_hops
+LIMIT $limit
+"""
+_GET_QUARANTINED_CLAIMS = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding)
+MATCH (action:ActionProposal {action_type: 'quarantine'})-[:BASED_ON]->(finding)
+MATCH (approval:ApprovalDecision)-[:APPROVES]->(action)
+MATCH (action)-[:TARGETS]->(claim:EvaluationClaim)
+RETURN DISTINCT claim.id
+LIMIT $limit
+"""
+_CREATE_QUARANTINE_PROPOSAL = """
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding)
+WHERE finding.status = 'confirmed' AND finding.coverage_complete = true
+MATCH (finding)-[:IMPACTS]->(claim:EvaluationClaim)
+WITH investigation, finding, collect(DISTINCT claim) AS claims
+WHERE size(claims) > 0
+MERGE (action:ActionProposal {id: $action_id})
+ON CREATE SET action.action_type = 'quarantine',
+              action.investigation_id = investigation.id,
+              action.reason = $reason,
+              action.created_at = $created_at
+MERGE (action)-[:BASED_ON]->(finding)
+WITH action, claims
+UNWIND claims AS claim
+MERGE (action)-[:TARGETS]->(claim)
+RETURN action.id, count(claim)
+"""
+_APPROVE_QUARANTINE = """
+MATCH (action:ActionProposal {id: $action_id, action_type: 'quarantine'})
+MATCH (action)-[:BASED_ON]->(finding:Finding)
+WHERE finding.status = 'confirmed' AND finding.coverage_complete = true
+MATCH (action)-[:TARGETS]->(claim:EvaluationClaim)
+WITH action, count(DISTINCT claim) AS target_count
+WHERE target_count > 0
+MERGE (approval:ApprovalDecision {id: $approval_id})
+ON CREATE SET approval.approver = $approver,
+              approval.reason = $reason,
+              approval.created_at = $created_at
+MERGE (approval)-[:APPROVES]->(action)
+RETURN approval.id
+"""
+_GET_ACTION = """
+MATCH (action:ActionProposal {id: $action_id})
+OPTIONAL MATCH (action)-[:TARGETS]->(claim:EvaluationClaim)
+OPTIONAL MATCH (approval:ApprovalDecision)-[:APPROVES]->(action)
+RETURN action.id, action.investigation_id, action.action_type, action.reason,
+       action.created_at, collect(DISTINCT claim.id), collect(DISTINCT approval.id),
+       collect(DISTINCT approval.approver), collect(DISTINCT approval.reason),
+       collect(DISTINCT approval.created_at)
+LIMIT 1
+"""
 
 
 class LineageGraphError(RuntimeError):
     """A fixed graph operation failed or returned an invalid result."""
+
+
+class ActionNotAllowed(RuntimeError):
+    """A quarantine proposal or approval failed its evidence preconditions."""
+
+
+class ImpactScopeExceeded(RuntimeError):
+    """A source-family traversal exceeds its configured run bound."""
 
 
 @dataclass(frozen=True)
@@ -240,6 +425,72 @@ class ExperimentRunRecord:
     prediction_sha256: str
     manifest_sha256: str
     artifact_path: str
+
+
+@dataclass(frozen=True)
+class RunCandidate:
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+
+
+@dataclass(frozen=True)
+class MetricClaimRecord:
+    claim_id: str
+    name: str
+    value: float
+
+
+@dataclass(frozen=True)
+class ImpactEvidenceRecord:
+    run_id: str
+    canonical_source_record_id: str
+    training_dataset_id: str
+    training_sample_id: str
+    training_derivation_hops: int
+    evaluation_dataset_id: str
+    evaluation_sample_id: str
+    evaluation_derivation_hops: int
+
+
+@dataclass(frozen=True)
+class ImpactedRunRecord:
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    model_id: str
+    model_configuration_id: str
+    evaluation_claim_id: str
+    metrics: tuple[MetricClaimRecord, ...]
+    evidence: tuple[ImpactEvidenceRecord, ...]
+    integrity_status: Literal["suspect", "quarantined"]
+
+
+@dataclass(frozen=True)
+class ImpactInvestigationRecord:
+    investigation_id: str
+    source_record_id: str
+    created_at: str
+    finding_status: Literal["confirmed", "clean_within_recorded_lineage", "unknown"]
+    coverage_complete: bool
+    unresolved_run_ids: tuple[str, ...]
+    impacted_runs: tuple[ImpactedRunRecord, ...]
+
+
+@dataclass(frozen=True)
+class QuarantineActionRecord:
+    action_id: str
+    investigation_id: str
+    status: Literal["proposed", "approved"]
+    reason: str
+    created_at: str
+    target_claim_ids: tuple[str, ...]
+    approval_id: str | None = None
+    approver: str | None = None
+    approval_reason: str | None = None
+    approved_at: str | None = None
 
 
 class GraphLineageStore:
@@ -549,6 +800,324 @@ class GraphLineageStore:
             prediction_sha256=str(row[18]),
             manifest_sha256=str(row[19]),
             artifact_path=str(row[20]),
+        )
+
+    def list_source_family_runs(self, source_record_id: str) -> list[RunCandidate]:
+        """List bounded candidate runs whose datasets name the source's family."""
+        source_rows = self._query(_GET_SOURCE_FAMILY, {"source_record_id": source_record_id})
+        if not source_rows:
+            raise KeyError(source_record_id)
+        if len(source_rows) != 1 or len(source_rows[0]) != 1:
+            raise LineageGraphError("FalkorDB returned invalid source family data")
+        rows = self._query(
+            _GET_SOURCE_FAMILY_RUNS,
+            {"source_record_id": source_record_id, "limit": _MAX_IMPACT_RUNS + 1},
+        )
+        if len(rows) > _MAX_IMPACT_RUNS:
+            raise ImpactScopeExceeded(
+                f"source family exceeds the {_MAX_IMPACT_RUNS}-run impact limit"
+            )
+        candidates: list[RunCandidate] = []
+        for row in rows:
+            if len(row) != 4:
+                raise LineageGraphError("FalkorDB returned invalid impact candidate data")
+            candidates.append(
+                RunCandidate(
+                    run_id=str(row[0]),
+                    experiment_id=str(row[1]),
+                    training_dataset_id=str(row[2]),
+                    evaluation_dataset_id=str(row[3]),
+                )
+            )
+        return candidates
+
+    def materialize_run_claims(
+        self, run: ExperimentRunRecord
+    ) -> tuple[str, str, tuple[MetricClaimRecord, ...]]:
+        """Project persisted measured run values into typed graph claim nodes."""
+        config_digest = hashlib.sha256(
+            f"{run.model_id}\0{run.model_config_json}".encode()
+        ).hexdigest()
+        model_configuration_id = f"model-configuration:{config_digest}"
+        evaluation_claim_id = f"evaluation-claim:{run.run_id}"
+        values = (
+            ("accuracy", run.accuracy),
+            ("precision", run.precision),
+            ("recall", run.recall),
+            ("f1", run.f1),
+        )
+        metrics = tuple(
+            MetricClaimRecord(claim_id=f"metric-claim:{run.run_id}:{name}", name=name, value=value)
+            for name, value in values
+        )
+        rows = self._query(
+            _MATERIALIZE_RUN_CLAIMS,
+            {
+                "run_id": run.run_id,
+                "model_configuration_id": model_configuration_id,
+                "model_id": run.model_id,
+                "model_config_json": run.model_config_json,
+                "evaluation_claim_id": evaluation_claim_id,
+                "metrics": [
+                    {"id": metric.claim_id, "name": metric.name, "value": metric.value}
+                    for metric in metrics
+                ],
+            },
+        )
+        if rows != [[len(metrics)]]:
+            raise LineageGraphError("FalkorDB did not persist the run's measured claims")
+        return model_configuration_id, evaluation_claim_id, metrics
+
+    def record_impact_investigation(self, investigation: ImpactInvestigationRecord) -> None:
+        """Append a finding, exact evidence paths and run-claim impact edges."""
+        finding_id = f"finding:{investigation.investigation_id}"
+        rows = self._query(
+            _RECORD_INVESTIGATION,
+            {
+                "investigation_id": investigation.investigation_id,
+                "finding_id": finding_id,
+                "source_record_id": investigation.source_record_id,
+                "created_at": investigation.created_at,
+            },
+        )
+        if rows != [[finding_id]]:
+            raise LineageGraphError("FalkorDB did not create the investigation record")
+
+        claim_ids = sorted({run.evaluation_claim_id for run in investigation.impacted_runs})
+        if claim_ids:
+            link_rows = self._query(
+                _LINK_FINDING_IMPACTS, {"finding_id": finding_id, "claim_ids": claim_ids}
+            )
+            if link_rows != [[len(claim_ids)]]:
+                raise LineageGraphError("FalkorDB did not link all impacted evaluation claims")
+
+        evidence_rows: list[dict[str, Any]] = []
+        for impacted_run in investigation.impacted_runs:
+            for evidence in impacted_run.evidence:
+                evidence_key = (
+                    f"{investigation.investigation_id}\0{evidence.run_id}"
+                    f"\0{evidence.canonical_source_record_id}\0{evidence.training_sample_id}"
+                    f"\0{evidence.evaluation_sample_id}"
+                )
+                evidence_rows.append(
+                    {
+                        "id": f"evidence:{hashlib.sha256(evidence_key.encode()).hexdigest()}",
+                        "run_id": evidence.run_id,
+                        "source_record_id": evidence.canonical_source_record_id,
+                        "training_dataset_id": evidence.training_dataset_id,
+                        "training_sample_id": evidence.training_sample_id,
+                        "training_derivation_hops": evidence.training_derivation_hops,
+                        "evaluation_dataset_id": evidence.evaluation_dataset_id,
+                        "evaluation_sample_id": evidence.evaluation_sample_id,
+                        "evaluation_derivation_hops": evidence.evaluation_derivation_hops,
+                        "evaluation_claim_id": impacted_run.evaluation_claim_id,
+                    }
+                )
+        for offset in range(0, len(evidence_rows), _WRITE_BATCH_SIZE):
+            batch = evidence_rows[offset : offset + _WRITE_BATCH_SIZE]
+            evidence_result = self._query(
+                _RECORD_EVIDENCE_PATHS, {"finding_id": finding_id, "rows": batch}
+            )
+            if evidence_result != [[len(batch)]]:
+                raise LineageGraphError("FalkorDB did not persist all impact evidence paths")
+
+        finalized = self._query(
+            _FINALIZE_INVESTIGATION,
+            {
+                "investigation_id": investigation.investigation_id,
+                "finding_id": finding_id,
+                "status": investigation.finding_status,
+                "coverage_complete": investigation.coverage_complete,
+                "unresolved_run_ids": list(investigation.unresolved_run_ids),
+            },
+        )
+        if finalized != [[finding_id]]:
+            raise LineageGraphError("FalkorDB did not finalize the investigation")
+
+    def get_investigation(self, investigation_id: str) -> ImpactInvestigationRecord:
+        """Read a persisted bounded impact report and its derived quarantine state."""
+        header_rows = self._query(_GET_INVESTIGATION, {"investigation_id": investigation_id})
+        if not header_rows:
+            raise KeyError(investigation_id)
+        if len(header_rows) != 1 or len(header_rows[0]) != 7:
+            raise LineageGraphError("FalkorDB returned invalid investigation data")
+        header = header_rows[0]
+        metric_rows = self._query(
+            _GET_IMPACT_METRICS,
+            {"investigation_id": investigation_id, "limit": _MAX_IMPACT_ROWS + 1},
+        )
+        if len(metric_rows) > _MAX_IMPACT_ROWS:
+            raise LineageGraphError("impact report exceeds the configured result limit")
+        evidence_rows = self._query(
+            _GET_IMPACT_EVIDENCE,
+            {"investigation_id": investigation_id, "limit": _MAX_IMPACT_ROWS + 1},
+        )
+        if len(evidence_rows) > _MAX_IMPACT_ROWS:
+            raise LineageGraphError("impact evidence exceeds the configured result limit")
+        quarantined_rows = self._query(
+            _GET_QUARANTINED_CLAIMS,
+            {"investigation_id": investigation_id, "limit": _MAX_IMPACT_ROWS + 1},
+        )
+        if len(quarantined_rows) > _MAX_IMPACT_ROWS:
+            raise LineageGraphError("quarantine target set exceeds the configured result limit")
+        quarantined_claim_ids: set[str] = set()
+        for row in quarantined_rows:
+            if len(row) != 1:
+                raise LineageGraphError("FalkorDB returned invalid quarantine target data")
+            if row[0] is not None:
+                quarantined_claim_ids.add(str(row[0]))
+
+        runs: dict[str, dict[str, Any]] = {}
+        for row in metric_rows:
+            if len(row) != 10:
+                raise LineageGraphError("FalkorDB returned invalid metric claim data")
+            run_id = str(row[0])
+            run_data = runs.setdefault(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "experiment_id": str(row[1]),
+                    "training_dataset_id": str(row[2]),
+                    "evaluation_dataset_id": str(row[3]),
+                    "model_id": str(row[4]),
+                    "model_configuration_id": str(row[5]),
+                    "evaluation_claim_id": str(row[6]),
+                    "metrics": {},
+                    "evidence": [],
+                },
+            )
+            run_data["metrics"][str(row[8])] = MetricClaimRecord(
+                claim_id=str(row[7]), name=str(row[8]), value=float(row[9])
+            )
+
+        for row in evidence_rows:
+            if len(row) != 8:
+                raise LineageGraphError("FalkorDB returned invalid impact evidence data")
+            run_id = str(row[0])
+            evidence_run = runs.get(run_id)
+            if evidence_run is None:
+                continue
+            evidence_run["evidence"].append(
+                ImpactEvidenceRecord(
+                    run_id=run_id,
+                    canonical_source_record_id=str(row[1]),
+                    training_dataset_id=str(row[2]),
+                    training_sample_id=str(row[3]),
+                    training_derivation_hops=int(row[4]),
+                    evaluation_dataset_id=str(row[5]),
+                    evaluation_sample_id=str(row[6]),
+                    evaluation_derivation_hops=int(row[7]),
+                )
+            )
+
+        impacted_runs = tuple(
+            ImpactedRunRecord(
+                run_id=run_data["run_id"],
+                experiment_id=run_data["experiment_id"],
+                training_dataset_id=run_data["training_dataset_id"],
+                evaluation_dataset_id=run_data["evaluation_dataset_id"],
+                model_id=run_data["model_id"],
+                model_configuration_id=run_data["model_configuration_id"],
+                evaluation_claim_id=run_data["evaluation_claim_id"],
+                metrics=tuple(sorted(run_data["metrics"].values(), key=lambda metric: metric.name)),
+                evidence=tuple(run_data["evidence"]),
+                integrity_status=(
+                    "quarantined"
+                    if run_data["evaluation_claim_id"] in quarantined_claim_ids
+                    else "suspect"
+                ),
+            )
+            for run_data in sorted(runs.values(), key=lambda item: item["run_id"])
+        )
+        raw_unresolved = header[6] or []
+        if not isinstance(raw_unresolved, list):
+            raise LineageGraphError("FalkorDB returned invalid unresolved run references")
+        return ImpactInvestigationRecord(
+            investigation_id=str(header[0]),
+            source_record_id=str(header[1]),
+            created_at=str(header[2]),
+            finding_status=str(header[4]),  # type: ignore[arg-type]
+            coverage_complete=bool(header[5]),
+            unresolved_run_ids=tuple(sorted(str(item) for item in raw_unresolved)),
+            impacted_runs=impacted_runs,
+        )
+
+    def propose_quarantine(self, investigation_id: str, reason: str) -> QuarantineActionRecord:
+        """Record an unapproved proposal targeting only confirmed impacted claims."""
+        investigation = self.get_investigation(investigation_id)
+        if investigation.finding_status != "confirmed" or not investigation.coverage_complete:
+            raise ActionNotAllowed("quarantine requires a confirmed finding with complete scope")
+        action_id = f"action:quarantine:{investigation_id}"
+        rows = self._query(
+            _CREATE_QUARANTINE_PROPOSAL,
+            {
+                "investigation_id": investigation_id,
+                "action_id": action_id,
+                "reason": reason,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            },
+        )
+        if not rows:
+            raise ActionNotAllowed("investigation has no eligible evaluation claims to quarantine")
+        if len(rows) != 1 or len(rows[0]) != 2:
+            raise LineageGraphError("FalkorDB returned invalid quarantine proposal data")
+        return self.get_quarantine_action(action_id)
+
+    def approve_quarantine(
+        self, action_id: str, approver: str, reason: str
+    ) -> QuarantineActionRecord:
+        """Append an explicit approval decision without editing original claims."""
+        action = self.get_quarantine_action(action_id)
+        if action.status == "approved":
+            return action
+        investigation = self.get_investigation(action.investigation_id)
+        if investigation.finding_status != "confirmed" or not investigation.coverage_complete:
+            raise ActionNotAllowed("approval requires a confirmed finding with complete scope")
+        approval_id = f"approval:{action_id}"
+        rows = self._query(
+            _APPROVE_QUARANTINE,
+            {
+                "action_id": action_id,
+                "approval_id": approval_id,
+                "approver": approver,
+                "reason": reason,
+                "created_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            },
+        )
+        if rows != [[approval_id]]:
+            raise ActionNotAllowed("quarantine proposal is missing or no longer eligible")
+        return self.get_quarantine_action(action_id)
+
+    def get_quarantine_action(self, action_id: str) -> QuarantineActionRecord:
+        rows = self._query(_GET_ACTION, {"action_id": action_id})
+        if not rows:
+            raise KeyError(action_id)
+        if len(rows) != 1 or len(rows[0]) != 10:
+            raise LineageGraphError("FalkorDB returned invalid quarantine action data")
+        row = rows[0]
+
+        def first_string(values: Any) -> str | None:
+            if isinstance(values, list):
+                for value in values:
+                    if value is not None:
+                        return str(value)
+            return None
+
+        raw_targets = row[5] or []
+        if not isinstance(raw_targets, list):
+            raise LineageGraphError("FalkorDB returned invalid quarantine targets")
+        approval_id = first_string(row[6])
+        return QuarantineActionRecord(
+            action_id=str(row[0]),
+            investigation_id=str(row[1]),
+            status="approved" if approval_id else "proposed",
+            reason=str(row[3]),
+            created_at=str(row[4]),
+            target_claim_ids=tuple(sorted(str(item) for item in raw_targets if item is not None)),
+            approval_id=approval_id,
+            approver=first_string(row[7]),
+            approval_reason=first_string(row[8]),
+            approved_at=first_string(row[9]),
         )
 
     def _count_untraced(self, dataset_id: str) -> int:

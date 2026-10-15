@@ -1,12 +1,13 @@
 # BenchWitness
 
-BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. **Milestone 3** adds a deterministic CPU 1-nearest-neighbor experiment runner. The runner resolves samples through the graph, verifies source artifacts, writes immutable prediction and run manifests, calculates metrics from those predictions, and records each run and its exact dataset versions in FalkorDB.
+BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–4 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, and approval-gated quarantine. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `apps/api/benchwitness_api` | FastAPI app, synthetic lineage generator, graph seed and audit |
+| `apps/api/benchwitness_api/impact.py` | Bounded impact investigation and quarantine approval service |
 | `apps/api/tests` | API smoke, deterministic fixture and real-graph integration tests |
 | `apps/web` | React, TypeScript and Vite application shell |
 | `workers/ml/benchwitness_ml` | Deterministic CPU experiment runner and run CLI |
@@ -82,6 +83,31 @@ The API equivalent is `POST /api/v1/demo/evaluate`. Each invocation appends thre
 
 These are measured results on the included synthetic scenario, not a promise that contamination changes scores in a particular direction. The API runs this small demo synchronously. Redis remains reserved for the later approved recovery job milestone. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
 
+## Trace impact and quarantine a result
+
+Use the `canonical_source_record_id` from a confirmed lineage audit. The investigation checks runs in that source family, verifies their recorded dataset pair, and returns exact training/evaluation sample paths with the model configuration, evaluation claim, and measured metric claims. If a candidate run cannot be verified, the report marks its scope incomplete and quarantine is disabled.
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/api/v1/impact -H 'Content-Type: application/json' -d '{"source_record_id":"<canonical_source_record_id-from-audit>"}'
+```
+
+The response includes an `investigation_id`. A quarantine proposal names the exact affected evaluation claim IDs and remains `proposed`; those claims and metrics are unchanged:
+
+```sh
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>/quarantine-proposals" -H 'Content-Type: application/json' -d '{"reason":"Confirmed sample-level train/evaluation overlap"}'
+```
+
+Only a separate explicit approval request appends the approval decision. Supply the `action_id` returned by the proposal and a reviewer label and reason:
+
+```sh
+curl -sS -X POST "http://127.0.0.1:8000/api/v1/actions/<action_id>/approve" -H 'Content-Type: application/json' -d '{"approver":"local-reviewer","reason":"I reviewed the source and sample evidence"}'
+curl -sS "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>"
+```
+
+The investigation then reports those claims as `quarantined` by following the approved decision edge. Original run records, evaluation claims, and metric values remain stored unchanged. These endpoints are for the local demo; do not expose mutation endpoints publicly without authentication.
+
+The graph represents a measured run as `ExperimentRun -[:USES_MODEL_CONFIGURATION]-> ModelConfiguration`, `ExperimentRun -[:HAS_EVALUATION]-> EvaluationClaim`, and `EvaluationClaim -[:REPORTS]-> MetricClaim`. An `Investigation` establishes a `Finding`; the finding points to exact `LineageEvidence` paths and impacted evaluation claims. `ActionProposal -[:TARGETS]-> EvaluationClaim` records proposed scope, while `ApprovalDecision -[:APPROVES]-> ActionProposal` records explicit approval.
+
 To start the frontend shell:
 
 ```sh
@@ -108,4 +134,4 @@ npm run build --prefix apps/web
 
 ## Milestone boundary
 
-Milestone 4 adds impact traversal and explicit quarantine approval. It is not implemented here. Do not treat lineage overlap as a measured score impact. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. Human review is required before the next milestone. AI-assisted implementation must be disclosed in the final submission.
+Milestone 5 adds approved clean recovery through the Redis-backed worker. It is not implemented here. Do not treat lineage overlap as a measured score impact. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. Human review is required before the next milestone. AI-assisted implementation must be disclosed in the final submission.

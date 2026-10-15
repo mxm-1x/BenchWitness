@@ -9,11 +9,13 @@ import pytest
 from benchwitness_api.demo_seed import DemoSeedService
 from benchwitness_api.graph import GraphProbe
 from benchwitness_api.graph_lineage import GraphLineageStore
+from benchwitness_api.impact import ImpactService
 from benchwitness_api.main import (
     app,
     get_demo_evaluation_runner,
     get_demo_seed_service,
     get_graph_lineage_store,
+    get_impact_service,
 )
 from benchwitness_api.settings import GraphSettings
 from benchwitness_ml.runner import DemoEvaluationRunner
@@ -43,6 +45,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         app.dependency_overrides[get_demo_evaluation_runner] = lambda: DemoEvaluationRunner(
             store, artifact_dir
         )
+        app.dependency_overrides[get_impact_service] = lambda: ImpactService(store)
         client = TestClient(app)
         seeded = client.post("/api/v1/demo/seed")
         assert seeded.status_code == 200
@@ -140,8 +143,6 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         assert {run["run_id"] for run in repeated_evaluation.json()["runs"]}.isdisjoint(
             {run["run_id"] for run in runs}
         )
-        app.dependency_overrides.clear()
-
         audits = {
             experiment_id: store.audit(experiment_id)
             for experiment_id in (
@@ -176,6 +177,108 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(tmp_path: P
         assert not unknown.coverage_complete
         assert unknown.training_samples_without_source == 1
         assert unknown.evidence == ()
+
+        source_record_id = audit_a.evidence[0].canonical_source_record_id
+        impact_response = client.post("/api/v1/impact", json={"source_record_id": source_record_id})
+        assert impact_response.status_code == 200
+        impact = impact_response.json()
+        assert impact["finding_status"] == "confirmed"
+        assert impact["coverage_complete"]
+        impacted_runs = impact["impacted_runs"]
+        assert {run["experiment_id"] for run in impacted_runs} == {
+            "demo-contaminated-a",
+            "demo-contaminated-b",
+        }
+        assert len(impacted_runs) == 4
+        assert all(run["integrity_status"] == "suspect" for run in impacted_runs)
+        assert all(
+            evidence["canonical_source_record_id"] == source_record_id
+            for run in impacted_runs
+            for evidence in run["evidence"]
+        )
+        assert all(
+            {metric["name"] for metric in run["metrics"]}
+            == {"accuracy", "precision", "recall", "f1"}
+            for run in impacted_runs
+        )
+        claim_ids = {run["evaluation_claim_id"] for run in impacted_runs}
+        prior_run_metrics = {
+            run["run_id"]: (
+                store.get_run(run["run_id"]).accuracy,
+                store.get_run(run["run_id"]).precision,
+                store.get_run(run["run_id"]).recall,
+                store.get_run(run["run_id"]).f1,
+            )
+            for run in impacted_runs
+        }
+
+        proposal_response = client.post(
+            f"/api/v1/investigations/{impact['investigation_id']}/quarantine-proposals",
+            json={"reason": "Confirmed sample-level train/evaluation overlap"},
+        )
+        assert proposal_response.status_code == 200
+        proposal = proposal_response.json()
+        assert proposal["status"] == "proposed"
+        assert set(proposal["target_claim_ids"]) == claim_ids
+
+        pending_impact = client.get(f"/api/v1/investigations/{impact['investigation_id']}")
+        assert pending_impact.status_code == 200
+        assert {run["integrity_status"] for run in pending_impact.json()["impacted_runs"]} == {
+            "suspect"
+        }
+        assert {
+            run["evaluation_claim_id"] for run in pending_impact.json()["impacted_runs"]
+        } == claim_ids
+
+        approval_response = client.post(
+            f"/api/v1/actions/{proposal['action_id']}/approve",
+            json={"approver": "integration-test", "reason": "Human approval for demo test"},
+        )
+        assert approval_response.status_code == 200
+        assert approval_response.json()["status"] == "approved"
+        assert set(approval_response.json()["target_claim_ids"]) == claim_ids
+
+        quarantined_impact = client.get(f"/api/v1/investigations/{impact['investigation_id']}")
+        assert quarantined_impact.status_code == 200
+        assert {run["integrity_status"] for run in quarantined_impact.json()["impacted_runs"]} == {
+            "quarantined"
+        }
+        assert {
+            run["evaluation_claim_id"] for run in quarantined_impact.json()["impacted_runs"]
+        } == claim_ids
+        for run_id, old_metrics in prior_run_metrics.items():
+            persisted_run = store.get_run(run_id)
+            assert (
+                persisted_run.accuracy,
+                persisted_run.precision,
+                persisted_run.recall,
+                persisted_run.f1,
+            ) == old_metrics
+
+        source_rows_for_control = [
+            json.loads(line)
+            for line in (artifact_dir / "source_records.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        clean_source_id = next(
+            row["source_record_id"]
+            for row in source_rows_for_control
+            if row["source_record_id"] != source_record_id
+        )
+        clean_impact_response = client.post(
+            "/api/v1/impact", json={"source_record_id": clean_source_id}
+        )
+        assert clean_impact_response.status_code == 200
+        clean_impact = clean_impact_response.json()
+        assert clean_impact["finding_status"] == "clean_within_recorded_lineage"
+        assert clean_impact["coverage_complete"]
+        assert clean_impact["impacted_runs"] == []
+        blocked_proposal = client.post(
+            f"/api/v1/investigations/{clean_impact['investigation_id']}/quarantine-proposals",
+            json={"reason": "A clean source must not be quarantined"},
+        )
+        assert blocked_proposal.status_code == 409
 
         clean_manifest_path = artifact_dir / "manifests" / "train-clean-control-v1.json"
         original_manifest = clean_manifest_path.read_text(encoding="utf-8")
