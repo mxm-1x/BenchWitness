@@ -1,6 +1,6 @@
 # BenchWitness
 
-BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–6 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, approval-gated quarantine, approved clean recovery, and typed agent tools with cross-session memory. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
+BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Milestones 1–7 provide sample-level lineage audits, deterministic CPU experiment runs, graph-backed impact investigation, approval-gated quarantine, approved clean recovery, typed agent tools with cross-session memory, and a browser workflow. Metrics are calculated from saved predictions; source ancestry and decisions are retained in FalkorDB.
 
 ## Layout
 
@@ -11,7 +11,7 @@ BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Mil
 | `apps/api/benchwitness_api/recovery.py` | Repair approval and Redis dispatch |
 | `apps/api/benchwitness_api/agent.py` | Typed local tool routing and verified graph memory |
 | `apps/api/tests` | API smoke, deterministic fixture and real-graph integration tests |
-| `apps/web` | React, TypeScript and Vite application shell |
+| `apps/web` | React, TypeScript and Vite investigation workspace |
 | `workers/ml/benchwitness_ml` | Deterministic CPU runner and approved repair worker |
 | `infra` | Infrastructure notes; root `compose.yaml` is the runnable setup |
 
@@ -147,13 +147,17 @@ Supported intents are `investigate_source`, `audit_experiment`, and `get_job_sta
 
 To demonstrate memory, create a **second** session with the first command and send the same `investigate_source` request using its new `session_id`. Its response should report `memory_status: verified` and the prior `investigation_id` if no run or lineage changed. Run `uv run benchwitness-run-demo` again, then repeat from a third session: the additional measured runs make the earlier snapshot stale, so a new investigation is recorded. `GET /api/v1/agent/sessions/<session_id>` confirms a session exists in FalkorDB.
 
-To start the frontend shell:
+## Run the browser workflow
+
+Start FalkorDB and the separate Redis broker with `docker compose up -d`, then run the API and worker in separate terminals after sourcing `.env` in each. Start the web app in a third terminal:
 
 ```sh
 npm run dev --prefix apps/web
 ```
 
-Vite prints the local URL. Opensource UI components and graph-backed product views are planned for later milestones.
+Open the local URL printed by Vite (normally `http://127.0.0.1:5173`). Paste `BENCHWITNESS_API_TOKEN` into the local approval token field; it is kept in that browser tab. Click **Seed graph**, then **Run baseline evaluations**. Choose a confirmed experiment or use the automatically selected canonical source record and click **Investigate source**. The bounded Cytoscape view shows actual sample ancestry returned by FalkorDB, and the impact panel shows the corresponding measured run and claim IDs. Enter a proposal reason, review the exact target claims, propose clean repair, enter a separate approval reason, and click **Approve & run repair**. With the worker running, the job status and measured before/after versions appear automatically. Finally, investigate the same source in two successive agent sessions to see verified graph memory. The browser also exposes quarantine approval, which retains the original metrics and claims.
+
+The experiment ledger reads `GET /api/v1/overview`, which contains current audits and a bounded list of measured run versions. The evidence view reads an investigation by ID, and the job panel polls `GET /api/v1/jobs/<job_id>` while work is pending. Empty, unavailable, and failed states are shown explicitly. The Opensource UI button adaptation and its MIT attribution are documented in [apps/web/OPENSOURCE_UI_ATTRIBUTION.md](apps/web/OPENSOURCE_UI_ATTRIBUTION.md). No hosted service or paid API is required.
 
 ## Checks
 
@@ -173,4 +177,4 @@ npm run build --prefix apps/web
 
 ## Milestone boundary
 
-Milestone 6 is implemented for the fixed local synthetic scenario. Do not treat lineage overlap as a measured score impact. Milestone 7 adds the Opensource UI investigation dashboard after human review. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. AI-assisted implementation must be disclosed in the final submission.
+Milestone 7 is implemented for the fixed local synthetic scenario. Lineage overlap is not itself a measured score impact; a clean refit may produce the same score. Milestone 8 covers fresh-start verification, demo video, and submission after human review. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. AI-assisted implementation must be disclosed in the final submission.

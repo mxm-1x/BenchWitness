@@ -66,6 +66,19 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         evaluation_response = client.post("/api/v1/demo/evaluate", headers=auth_headers)
         assert evaluation_response.status_code == 200
         runs = evaluation_response.json()["runs"]
+        overview = client.get("/api/v1/overview")
+        assert overview.status_code == 200
+        assert {audit["experiment_id"] for audit in overview.json()["audits"]} == {
+            "demo-contaminated-a",
+            "demo-contaminated-b",
+            "demo-clean-control",
+            "demo-unknown-lineage",
+        }
+        assert {run["run_id"] for run in overview.json()["runs"]} == {run["run_id"] for run in runs}
+        assert (
+            client.get(f"/api/v1/runs/{runs[0]['run_id']}").json()["accuracy"]
+            == runs[0]["accuracy"]
+        )
         assert {run["experiment_id"] for run in runs} == {
             "demo-contaminated-a",
             "demo-contaminated-b",

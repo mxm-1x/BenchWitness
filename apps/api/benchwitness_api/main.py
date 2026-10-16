@@ -99,6 +99,11 @@ class DemoEvaluationResponse(BaseModel):
     runs: list[ExperimentRunResponse]
 
 
+class OverviewResponse(BaseModel):
+    audits: list[LineageAuditResponse]
+    runs: list[ExperimentRunResponse]
+
+
 class ImpactRequest(BaseModel):
     source_record_id: str = Field(min_length=1, max_length=200)
 
@@ -399,6 +404,33 @@ def audit_experiment_lineage(
             content={"error": "graph_unavailable", "message": "FalkorDB audit failed"},
         )
     return _audit_response(result)
+
+
+@app.get("/api/v1/overview", response_model=OverviewResponse)
+def get_overview(
+    store: Annotated[GraphLineageStore, Depends(get_graph_lineage_store)],
+) -> OverviewResponse | JSONResponse:
+    try:
+        ids = store.list_demo_experiment_ids()
+        return OverviewResponse(
+            audits=[_audit_response(store.audit(experiment_id)) for experiment_id in ids],
+            runs=[ExperimentRunResponse(**run.__dict__) for run in store.list_runs()],
+        )
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
+
+
+@app.get("/api/v1/runs/{run_id}", response_model=ExperimentRunResponse)
+def get_measured_run(
+    run_id: str,
+    store: Annotated[GraphLineageStore, Depends(get_graph_lineage_store)],
+) -> ExperimentRunResponse | JSONResponse:
+    try:
+        return ExperimentRunResponse(**store.get_run(run_id).__dict__)
+    except KeyError:
+        return JSONResponse(status_code=404, content={"error": "run_not_found"})
+    except LineageGraphError:
+        return JSONResponse(status_code=503, content={"error": "graph_unavailable"})
 
 
 @app.post("/api/v1/demo/evaluate", response_model=DemoEvaluationResponse)

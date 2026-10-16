@@ -92,6 +92,19 @@ RETURN experiment.id, training.id, training.lineage_complete,
        evaluation.id, evaluation.lineage_complete
 LIMIT 1
 """
+_LIST_DEMO_EXPERIMENT_IDS = """
+MATCH (experiment:Experiment)
+WHERE experiment.id STARTS WITH 'demo-'
+RETURN experiment.id
+ORDER BY experiment.id
+LIMIT 5
+"""
+_LIST_RUN_IDS = """
+MATCH (run:ExperimentRun)
+RETURN run.id
+ORDER BY run.created_at DESC
+LIMIT $limit
+"""
 _GET_DATASET_MANIFEST = """
 MATCH (dataset:DatasetVersion {id: $dataset_id})
 OPTIONAL MATCH (dataset)-[:CONTAINS]->(sample:SampleVersion)
@@ -812,6 +825,20 @@ class GraphLineageStore:
             source_artifact_verified=source_artifact_verified,
             evidence=evidence,
         )
+
+    def list_demo_experiment_ids(self) -> tuple[str, ...]:
+        """Discover only the fixed demo experiment family from FalkorDB."""
+        rows = self._query(_LIST_DEMO_EXPERIMENT_IDS)
+        if len(rows) > 4 or any(len(row) != 1 for row in rows):
+            raise LineageGraphError("FalkorDB returned an invalid demo experiment list")
+        return tuple(str(row[0]) for row in rows)
+
+    def list_runs(self) -> tuple[ExperimentRunRecord, ...]:
+        """Return at most 100 measured runs, refusing a silently truncated list."""
+        rows = self._query(_LIST_RUN_IDS, {"limit": 101})
+        if len(rows) > 100 or any(len(row) != 1 for row in rows):
+            raise LineageGraphError("measured run list exceeds the 100-run bound")
+        return tuple(self.get_run(str(row[0])) for row in rows)
 
     def _verify_dataset_manifest(self, dataset_id: str) -> tuple[bool, str, str, str, int, int]:
         rows = self._query(_GET_DATASET_MANIFEST, {"dataset_id": dataset_id})
