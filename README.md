@@ -86,7 +86,7 @@ uv run benchwitness-run-demo
 
 The API equivalent is `POST /api/v1/demo/evaluate`. Each invocation appends three new run versions; repeated runs use new run IDs and artifacts while producing the same metrics for unchanged seeded inputs. The runner uses 1-nearest-neighbor with squared Euclidean distance and deterministic sample-ID tie breaking. Accuracy, positive-class precision/recall/F1, and confusion counts are computed from saved predictions. Each run manifest records dataset IDs, model configuration, metric definition, counts, and checksums. Generated artifacts under `artifacts/runs/` are ignored by Git.
 
-These are measured results on the included synthetic scenario, not a promise that contamination changes scores in a particular direction. The API runs this small demo synchronously. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
+These are measured results on the included synthetic scenario, not a promise that contamination changes scores in a particular direction. The current seed copies one held-out row into each contaminated training set. With seed `20261015`, the simple linear label rule lets 1-nearest-neighbor reach 99.0% accuracy even after that row is removed, so this run reports a 0.0 percentage-point change. The graph still proves the source overlap; the synthetic fixture demonstrates that lineage evidence and metric impact are separate findings. The recovery panel shows the measured delta and both split sizes. The API runs this small demo synchronously. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
 
 ## Trace impact and quarantine a result
 
