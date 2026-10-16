@@ -11,7 +11,8 @@ BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Mil
 | `apps/api/benchwitness_api/recovery.py` | Repair approval and Redis dispatch |
 | `apps/api/benchwitness_api/agent.py` | Typed local tool routing and verified graph memory |
 | `apps/api/tests` | API smoke, deterministic fixture and real-graph integration tests |
-| `apps/web` | React, TypeScript and Vite investigation workspace |
+| `apps/site` | Selected Next.js landing page and graph-backed workspace on port 3000 |
+| `apps/web` | Earlier React/Vite workspace, retained for review |
 | `workers/ml/benchwitness_ml` | Deterministic CPU runner and approved repair worker |
 | `infra` | Infrastructure notes; root `compose.yaml` is the runnable setup |
 
@@ -35,6 +36,7 @@ set +a
 nvm use
 uv sync --locked
 npm ci --prefix apps/web
+npm ci --prefix apps/site
 docker compose up -d
 docker compose ps
 ```
@@ -67,14 +69,14 @@ With FalkorDB running, seed the deterministic 400-row synthetic source, split ma
 uv run benchwitness-seed-demo
 ```
 
-The command writes source rows and manifests under `artifacts/demo/` (ignored by Git) and idempotently merges the lineage graph. It uses no external dataset, paid API, or hosted service. Every API `POST` requires the bearer token configured in `.env`; read-only health and audit requests do not. You can also seed through the API after starting Uvicorn:
+The command writes versioned source rows and manifests under `artifacts/demo/scenarios/synthetic-memorization-v2/` (ignored by Git) and idempotently merges the lineage graph. It uses no external dataset, paid API, or hosted service. Every API `POST` requires the bearer token configured in `.env`; read-only health and audit requests do not. You can also seed through the API after starting Uvicorn:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8000/api/v1/demo/seed -H "Authorization: Bearer $BENCHWITNESS_API_TOKEN"
-curl -sS http://127.0.0.1:8000/api/v1/experiments/demo-contaminated-a/lineage-audit
+curl -sS http://127.0.0.1:8000/api/v1/experiments/demo-v2-contaminated-a/lineage-audit
 ```
 
-The scenario records one held-out canonical source row copied into each of two training versions, a clean training control from the same source family, and a sample with missing lineage. Auditing `demo-contaminated-a` and `demo-contaminated-b` returns `confirmed` with exact source and sample IDs; `demo-clean-control` returns `clean_within_recorded_lineage`; `demo-unknown-lineage` returns `unknown`. A complete result requires graph memberships and counts to match local manifests, and graph source IDs and counts to match the source artifact digest. The audit uses fixed parameter-bound Cypher, a three-hop derivation bound, a 100-path response cap, and a query timeout.
+The active scenario is `synthetic-memorization-v2`. It creates 400 synthetic rows with random binary labels independent of the two numeric features, then makes a stratified 300/100 train/evaluation split. It copies 20 held-out rows, with their real source ancestry, into each contaminated training version. The clean control contains the 300 intended training rows; a separate fixture has missing lineage. Auditing `demo-v2-contaminated-a` and `demo-v2-contaminated-b` returns `confirmed`; `demo-v2-clean-control` returns `clean_within_recorded_lineage`; `demo-v2-unknown-lineage` returns `unknown`. Artifacts are stored under `artifacts/demo/scenarios/synthetic-memorization-v2/`, leaving the earlier v1 files intact. The split manifest records the label rule and copy policy. A complete result requires memberships and counts to match manifests, each sample's recorded ancestry to resolve through every parent branch to one canonical source, and graph source IDs/counts to match the source artifact digest. The audit uses fixed parameter-bound Cypher, a three-hop derivation bound, a 100-path response cap, and a query timeout.
 
 ## Run and inspect measured demo experiments
 
@@ -84,9 +86,9 @@ After seeding the demo, run the three graph-defined experiments locally:
 uv run benchwitness-run-demo
 ```
 
-The API equivalent is `POST /api/v1/demo/evaluate`. Each invocation appends three new run versions; repeated runs use new run IDs and artifacts while producing the same metrics for unchanged seeded inputs. The runner uses 1-nearest-neighbor with squared Euclidean distance and deterministic sample-ID tie breaking. Accuracy, positive-class precision/recall/F1, and confusion counts are computed from saved predictions. Each run manifest records dataset IDs, model configuration, metric definition, counts, and checksums. Generated artifacts under `artifacts/runs/` are ignored by Git.
+The API equivalent is `POST /api/v1/demo/evaluate`. Each invocation appends three new run versions; repeated runs use new run IDs and artifacts while producing the same metrics for unchanged seeded inputs. The runner uses 1-nearest-neighbor with squared Euclidean distance and deterministic sample-ID tie breaking. Accuracy, positive-class precision/recall/F1, and confusion counts are computed from saved predictions. Each run manifest records dataset IDs, model configuration, metric definition, counts, and checksums. Generated source, prediction, and model artifacts are ignored by Git and stored beneath `artifacts/demo/scenarios/synthetic-memorization-v2/`.
 
-These are measured results on the included synthetic scenario, not a promise that contamination changes scores in a particular direction. The current seed copies one held-out row into each contaminated training set. With seed `20261015`, the simple linear label rule lets 1-nearest-neighbor reach 99.0% accuracy even after that row is removed, so this run reports a 0.0 percentage-point change. The graph still proves the source overlap; the synthetic fixture demonstrates that lineage evidence and metric impact are separate findings. The recovery panel shows the measured delta and both split sizes. The API runs this small demo synchronously. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
+This is a disclosed memorization stress test, not a general benchmark claim. Exact copied records give 1-nearest-neighbor a direct route to recall held-out labels. With the bundled seed, measured contaminated accuracy is 58.0% and clean-control accuracy is 48.0%; positive-class F1 is 60.4% and 50.0%, respectively. Recovery removes the copies and remeasures against the same 100 held-out records. The UI shows measured accuracy and F1 before and after, the split sizes, and both deltas. These are measured outcomes for this fixed synthetic probe; they do not describe expected performance on a representative task. Evaluation blocks if lineage is unknown or artifact integrity checks fail.
 
 ## Trace impact and quarantine a result
 
@@ -177,7 +179,7 @@ curl -sS -X POST "http://127.0.0.1:8000/api/v1/repairs/<action_id>/approve" -H "
 curl -sS "http://127.0.0.1:8000/api/v1/jobs/<job_id>"
 ```
 
-The worker verifies the clean training and held-out evaluation memberships against FalkorDB and the saved split manifest, refits the fixed 1-nearest-neighbor classifier on the clean records, calculates fresh predictions and metrics, then appends a recovery experiment/run and hashed model-training-row artifact for each affected original run. `RecoveryJob` state and approval are stored in FalkorDB; Redis holds transient dispatch only. The `repaired_run_ids` in the job response can be inspected against the original run IDs. Repeating the approval request returns the same job and does not enqueue another copy. A broker failure appears as a `failed` graph job with an error code. If the worker process stops while a job is running, inspect the graph job and RQ state before restarting; automatic crash reconciliation is not yet implemented.
+The worker verifies the clean training and held-out evaluation memberships against FalkorDB and the saved split manifest, refits the fixed 1-nearest-neighbor classifier on the clean records, calculates fresh predictions and metrics, then appends a recovery experiment/run and hashed model-training-row artifact for each affected original run. `RecoveryJob` state and approval are stored in FalkorDB; Redis holds transient dispatch only. The `repaired_run_ids` in the job response can be inspected against the original run IDs. Repeating approval while queued or after success is idempotent. A broker or worker failure appears as a `failed` graph job; repeating the approval request explicitly retries it. Recovery artifacts are content-checked and reused when a retry resumes a partially completed job. The RQ attempt has a five-minute timeout. When a poll or approval sees a `running` job older than six minutes, it marks that attempt failed with a compare-and-set graph update; approving again retries the same approved repair.
 
 ## Typed agent and graph memory
 
@@ -194,15 +196,15 @@ To demonstrate memory, create a **second** session with the first command and se
 
 ## Run the browser workflow
 
-Start FalkorDB and the separate Redis broker with `docker compose up -d`, then run the API and worker in separate terminals after sourcing `.env` in each. Start the web app in a third terminal:
+Start FalkorDB and the separate Redis broker with `docker compose up -d`, then run the API and worker in separate terminals after sourcing `.env` in each. Start the selected web app in a third terminal:
 
 ```sh
-npm run dev --prefix apps/web
+npm run dev --prefix apps/site -- --hostname 127.0.0.1 --port 3000
 ```
 
-Open the local URL printed by Vite (normally `http://127.0.0.1:5173`). Paste `BENCHWITNESS_API_TOKEN` into the local approval token field; it is kept in that browser tab. Click **Seed graph**, then **Run baseline evaluations**. Choose a confirmed experiment or use the automatically selected canonical source record and click **Investigate source**. The bounded Cytoscape view shows actual sample ancestry returned by FalkorDB, and the impact panel shows the corresponding measured run and claim IDs. Enter a proposal reason, review the exact target claims, propose clean repair, enter a separate approval reason, and click **Approve & run repair**. With the worker running, the job status and measured before/after versions appear automatically. Finally, investigate the same source in two successive agent sessions to see verified graph memory. The browser also exposes quarantine approval, which retains the original metrics and claims.
+Open `http://127.0.0.1:3000`. Paste `BENCHWITNESS_API_TOKEN` into the local workspace token field; it is kept in that browser tab. Click **Seed graph**, then **Run baseline evaluations** if the graph has no recorded runs. Select a confirmed experiment, inspect its exact sample ancestry, and click **Investigate source**. Review target claim IDs, propose clean repair, enter a separate approval reason, and approve. The workspace polls the real worker job and loads saved before/after run metrics after success. Start another agent session and investigate the same source to inspect verified graph memory. Quarantine has a separate proposal and approval action.
 
-The experiment ledger reads `GET /api/v1/overview`, which contains current audits and a bounded list of measured run versions. The evidence view reads an investigation by ID, and the job panel polls `GET /api/v1/jobs/<job_id>` while work is pending. Empty, unavailable, and failed states are shown explicitly. The Opensource UI button adaptation and its MIT attribution are documented in [apps/web/OPENSOURCE_UI_ATTRIBUTION.md](apps/web/OPENSOURCE_UI_ATTRIBUTION.md). No hosted service or paid API is required.
+The experiment ledger reads `GET /api/v1/overview`, which contains current audits and a bounded list of measured run versions. The evidence view reads an investigation by ID, and the job panel polls `GET /api/v1/jobs/<job_id>` while work is pending. Empty, unavailable, and failed states are shown explicitly. Frontend library attribution is in [apps/site/ATTRIBUTION.md](apps/site/ATTRIBUTION.md); the earlier Vite adaptation is in [apps/web/OPENSOURCE_UI_ATTRIBUTION.md](apps/web/OPENSOURCE_UI_ATTRIBUTION.md). No hosted service or paid API is required.
 
 ## Checks
 
@@ -216,6 +218,9 @@ uv run mypy
 npm run lint --prefix apps/web
 npm run typecheck --prefix apps/web
 npm run build --prefix apps/web
+npm run lint --prefix apps/site
+npm run typecheck --prefix apps/site
+npm run build --prefix apps/site
 ```
 
 `uv run pytest -m "not integration"` runs API and deterministic fixture tests when the graph is unavailable; it does **not** satisfy the real-graph integration gate. Stop local services with `docker compose down` when finished.
@@ -230,4 +235,4 @@ The script binds an isolated Compose project to `127.0.0.1:16379` and `127.0.0.1
 
 ## Milestone boundary
 
-Milestones 1–7 are implemented. Milestone 8's local fresh-volume, persistence, and quality checks have passed; the remaining release steps are human review, recording/reviewing the demo video, and submitting it with the selected track. Lineage overlap is not itself a measured score impact; a clean refit may produce the same score. Review [AI assistance disclosure](docs/AI_ASSISTANCE_DISCLOSURE.md), [demo script](docs/DEMO_SCRIPT.md), and [submission checklist](docs/SUBMISSION_CHECKLIST.md) before submitting. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) provide background.
+Milestones 1–7 are implemented. Fresh-volume seed, evaluation, restart persistence, integration, lint, type, and frontend build checks passed on 2026-10-16. The remaining release steps are human review, recording/reviewing the demo video, and submitting it with the selected track. Review [AI assistance disclosure](docs/AI_ASSISTANCE_DISCLOSURE.md), [demo script](docs/DEMO_SCRIPT.md), and [submission checklist](docs/SUBMISSION_CHECKLIST.md) before submitting. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) provide background.

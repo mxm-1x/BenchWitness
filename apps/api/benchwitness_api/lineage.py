@@ -8,6 +8,16 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
+SCENARIO_VERSION = "synthetic-memorization-v2"
+DEMO_EXPERIMENTS = (
+    "demo-v2-contaminated-a",
+    "demo-v2-contaminated-b",
+    "demo-v2-clean-control",
+    "demo-v2-unknown-lineage",
+)
+EVALUATION_DATASET_ID = f"dataset:{SCENARIO_VERSION}:eval"
+CLEAN_TRAINING_DATASET_ID = f"dataset:{SCENARIO_VERSION}:train-clean-control"
+
 
 @dataclass(frozen=True)
 class SourceRecord:
@@ -34,6 +44,8 @@ class ExperimentLineage:
 
 @dataclass(frozen=True)
 class DemoScenario:
+    source_family_id: str
+    generator_version: str
     source_records: tuple[SourceRecord, ...]
     sample_rows: tuple[dict[str, Any], ...]
     source_link_rows: tuple[dict[str, str], ...]
@@ -43,6 +55,9 @@ class DemoScenario:
     experiments: tuple[ExperimentLineage, ...]
     source_digest: str
     split_digest: str
+    train_source_record_ids: tuple[str, ...]
+    eval_source_record_ids: tuple[str, ...]
+    leaked_source_record_ids: tuple[str, ...]
 
 
 def _digest(value: object) -> str:
@@ -70,20 +85,23 @@ def source_records_digest(source_rows: list[dict[str, Any]]) -> str:
 
 
 def build_demo_scenario(row_count: int = 400, seed: int = 20261015) -> DemoScenario:
-    """Build a repeatable split and source-level lineage fixture without metric claims."""
+    """Build the disclosed synthetic memorization probe and exact source lineage."""
     if row_count < 8 or row_count % 2:
         raise ValueError("row_count must be an even integer of at least 8")
 
     rng = random.Random(seed)
+    label_rng = random.Random(seed + 1_000_003)
     records: list[SourceRecord] = []
     for index in range(row_count):
         x1 = round(rng.uniform(-1.0, 1.0), 6)
         x2 = round(rng.uniform(-1.0, 1.0), 6)
         records.append(
             SourceRecord(
-                source_record_id=f"source:synthetic-v1:{index:04d}",
+                source_record_id=f"source:{SCENARIO_VERSION}:{index:04d}",
                 features=(x1, x2),
-                label=int(x1 + x2 >= 0.0),
+                # Labels are independent of features. This deliberately tests exact
+                # memorization through copied rows, not generalization quality.
+                label=label_rng.getrandbits(1),
             )
         )
 
@@ -110,9 +128,12 @@ def build_demo_scenario(row_count: int = 400, seed: int = 20261015) -> DemoScena
         for record in records
     ]
     source_digest = source_records_digest(source_rows)
+    leak_rng = random.Random(seed + 7_919)
+    leaked_ids = tuple(sorted(leak_rng.sample(sorted(eval_ids), round(len(eval_ids) * 0.2))))
     split_data = {
         "train_source_record_ids": sorted(train_ids),
         "eval_source_record_ids": sorted(eval_ids),
+        "leaked_source_record_ids": list(leaked_ids),
     }
     split_digest = _digest(split_data)
 
@@ -121,58 +142,63 @@ def build_demo_scenario(row_count: int = 400, seed: int = 20261015) -> DemoScena
     derivation_rows: list[dict[str, str]] = []
     source_to_sample: dict[str, str] = {}
     for record in records:
-        sample_id = f"sample:source-v1:{record.source_record_id.rsplit(':', 1)[1]}"
+        sample_id = f"sample:{SCENARIO_VERSION}:source:{record.source_record_id.rsplit(':', 1)[1]}"
         source_to_sample[record.source_record_id] = sample_id
         sample_rows.append({"id": sample_id, "kind": "source", "lineage_complete": True})
         source_link_rows.append(
             {"sample_id": sample_id, "source_record_id": record.source_record_id}
         )
 
-    leaked_source_id = min(eval_ids)
-    contaminated_sample_ids: dict[str, str] = {}
-    for experiment_id in ("demo-contaminated-a", "demo-contaminated-b"):
-        copied_sample_id = f"sample:copy:{experiment_id}:{leaked_source_id.rsplit(':', 1)[1]}"
-        contaminated_sample_ids[experiment_id] = copied_sample_id
-        sample_rows.append({"id": copied_sample_id, "kind": "copy", "lineage_complete": True})
-        derivation_rows.append(
-            {
-                "sample_id": copied_sample_id,
-                "parent_sample_id": source_to_sample[leaked_source_id],
-            }
-        )
+    contaminated_sample_ids: dict[str, list[str]] = {}
+    for experiment_id in DEMO_EXPERIMENTS[:2]:
+        copied_ids: list[str] = []
+        for leaked_source_id in leaked_ids:
+            copied_sample_id = (
+                f"sample:{SCENARIO_VERSION}:copy:{experiment_id}:"
+                f"{leaked_source_id.rsplit(':', 1)[1]}"
+            )
+            copied_ids.append(copied_sample_id)
+            sample_rows.append({"id": copied_sample_id, "kind": "copy", "lineage_complete": True})
+            derivation_rows.append(
+                {
+                    "sample_id": copied_sample_id,
+                    "parent_sample_id": source_to_sample[leaked_source_id],
+                }
+            )
+        contaminated_sample_ids[experiment_id] = copied_ids
 
-    unknown_sample_id = "sample:unknown:demo"
+    unknown_sample_id = f"sample:{SCENARIO_VERSION}:unknown"
     sample_rows.append({"id": unknown_sample_id, "kind": "unknown", "lineage_complete": False})
 
     manifest_specs: list[tuple[str, str, list[str], bool]] = [
         (
-            "dataset:eval-v1",
+            EVALUATION_DATASET_ID,
             "evaluation",
             [source_to_sample[item] for item in sorted(eval_ids)],
             True,
         ),
         (
-            "dataset:train-contaminated-a-v1",
+            f"dataset:{SCENARIO_VERSION}:train-contaminated-a",
             "training",
             [source_to_sample[item] for item in sorted(train_ids)]
-            + [contaminated_sample_ids["demo-contaminated-a"]],
+            + contaminated_sample_ids["demo-v2-contaminated-a"],
             True,
         ),
         (
-            "dataset:train-contaminated-b-v1",
+            f"dataset:{SCENARIO_VERSION}:train-contaminated-b",
             "training",
             [source_to_sample[item] for item in sorted(train_ids)]
-            + [contaminated_sample_ids["demo-contaminated-b"]],
+            + contaminated_sample_ids["demo-v2-contaminated-b"],
             True,
         ),
         (
-            "dataset:train-clean-control-v1",
+            CLEAN_TRAINING_DATASET_ID,
             "training",
             [source_to_sample[item] for item in sorted(train_ids)],
             True,
         ),
         (
-            "dataset:train-unknown-lineage-v1",
+            f"dataset:{SCENARIO_VERSION}:train-unknown-lineage",
             "training",
             [source_to_sample[item] for item in sorted(train_ids)] + [unknown_sample_id],
             False,
@@ -196,16 +222,20 @@ def build_demo_scenario(row_count: int = 400, seed: int = 20261015) -> DemoScena
     ]
     experiments = (
         ExperimentLineage(
-            "demo-contaminated-a", "dataset:train-contaminated-a-v1", "dataset:eval-v1"
+            DEMO_EXPERIMENTS[0],
+            f"dataset:{SCENARIO_VERSION}:train-contaminated-a",
+            EVALUATION_DATASET_ID,
         ),
         ExperimentLineage(
-            "demo-contaminated-b", "dataset:train-contaminated-b-v1", "dataset:eval-v1"
+            DEMO_EXPERIMENTS[1],
+            f"dataset:{SCENARIO_VERSION}:train-contaminated-b",
+            EVALUATION_DATASET_ID,
         ),
+        ExperimentLineage(DEMO_EXPERIMENTS[2], CLEAN_TRAINING_DATASET_ID, EVALUATION_DATASET_ID),
         ExperimentLineage(
-            "demo-clean-control", "dataset:train-clean-control-v1", "dataset:eval-v1"
-        ),
-        ExperimentLineage(
-            "demo-unknown-lineage", "dataset:train-unknown-lineage-v1", "dataset:eval-v1"
+            DEMO_EXPERIMENTS[3],
+            f"dataset:{SCENARIO_VERSION}:train-unknown-lineage",
+            EVALUATION_DATASET_ID,
         ),
     )
     # Keep the variable referenced so a changed manifest definition cannot silently
@@ -218,6 +248,8 @@ def build_demo_scenario(row_count: int = 400, seed: int = 20261015) -> DemoScena
         raise ValueError("experiment references an unknown dataset manifest")
 
     return DemoScenario(
+        source_family_id=SCENARIO_VERSION,
+        generator_version="independent-binary-labels-v2",
         source_records=tuple(records),
         sample_rows=tuple(sample_rows),
         source_link_rows=tuple(source_link_rows),
@@ -227,4 +259,7 @@ def build_demo_scenario(row_count: int = 400, seed: int = 20261015) -> DemoScena
         experiments=experiments,
         source_digest=source_digest,
         split_digest=split_digest,
+        train_source_record_ids=tuple(sorted(train_ids)),
+        eval_source_record_ids=tuple(sorted(eval_ids)),
+        leaked_source_record_ids=leaked_ids,
     )

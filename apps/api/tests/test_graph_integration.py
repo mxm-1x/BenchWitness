@@ -54,10 +54,13 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         )
         app.dependency_overrides[get_impact_service] = lambda: ImpactService(store)
         client = TestClient(app)
+        evaluate_before_seed = client.post("/api/v1/demo/evaluate", headers=auth_headers)
+        assert evaluate_before_seed.status_code == 409
+        assert evaluate_before_seed.json()["error"] == "demo_not_seeded"
         seeded = client.post("/api/v1/demo/seed", headers=auth_headers)
         assert seeded.status_code == 200
         assert seeded.json()["source_records_processed"] == 400
-        api_audit = client.get("/api/v1/experiments/demo-contaminated-a/lineage-audit")
+        api_audit = client.get("/api/v1/experiments/demo-v2-contaminated-a/lineage-audit")
         assert api_audit.status_code == 200
         assert api_audit.json()["status"] == "confirmed"
         assert api_audit.json()["coverage_complete"]
@@ -69,10 +72,10 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         overview = client.get("/api/v1/overview")
         assert overview.status_code == 200
         assert {audit["experiment_id"] for audit in overview.json()["audits"]} == {
-            "demo-contaminated-a",
-            "demo-contaminated-b",
-            "demo-clean-control",
-            "demo-unknown-lineage",
+            "demo-v2-contaminated-a",
+            "demo-v2-contaminated-b",
+            "demo-v2-clean-control",
+            "demo-v2-unknown-lineage",
         }
         assert {run["run_id"] for run in overview.json()["runs"]} == {run["run_id"] for run in runs}
         assert all("artifact_path" not in run for run in overview.json()["runs"])
@@ -95,14 +98,14 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
             == runs[0]["accuracy"]
         )
         assert {run["experiment_id"] for run in runs} == {
-            "demo-contaminated-a",
-            "demo-contaminated-b",
-            "demo-clean-control",
+            "demo-v2-contaminated-a",
+            "demo-v2-contaminated-b",
+            "demo-v2-clean-control",
         }
         metrics_by_experiment = {}
         for run in runs:
             assert run["evaluation_sample_count"] == 100
-            assert run["training_sample_count"] in (300, 301)
+            assert run["training_sample_count"] in (300, 320)
             assert (
                 sum(
                     run[key]
@@ -178,28 +181,86 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         assert {run["run_id"] for run in repeated_evaluation.json()["runs"]}.isdisjoint(
             {run["run_id"] for run in runs}
         )
+        accuracy_by_experiment = {run["experiment_id"]: run["accuracy"] for run in runs}
+        assert (
+            accuracy_by_experiment["demo-v2-contaminated-a"]
+            == accuracy_by_experiment["demo-v2-contaminated-b"]
+        )
+        assert (
+            accuracy_by_experiment["demo-v2-contaminated-a"]
+            - accuracy_by_experiment["demo-v2-clean-control"]
+            >= 0.05
+        )
         audits = {
             experiment_id: store.audit(experiment_id)
             for experiment_id in (
-                "demo-contaminated-a",
-                "demo-contaminated-b",
-                "demo-clean-control",
-                "demo-unknown-lineage",
+                "demo-v2-contaminated-a",
+                "demo-v2-contaminated-b",
+                "demo-v2-clean-control",
+                "demo-v2-unknown-lineage",
             )
         }
-        audit_a = audits["demo-contaminated-a"]
-        audit_b = audits["demo-contaminated-b"]
+        audit_a = audits["demo-v2-contaminated-a"]
+        audit_b = audits["demo-v2-contaminated-b"]
         assert audit_a.status == "confirmed"
         assert audit_b.status == "confirmed"
         assert audit_a.coverage_complete
         assert audit_b.coverage_complete
+        assert len(audit_a.evidence) == 20
+        assert len(audit_b.evidence) == 20
         assert {item.canonical_source_record_id for item in audit_a.evidence} == {
             item.canonical_source_record_id for item in audit_b.evidence
         }
         assert audit_a.evidence[0].training_derivation_hops == 2
         assert audit_a.evidence[0].evaluation_derivation_hops == 1
 
-        clean = audits["demo-clean-control"]
+        # A sample with multiple canonical ancestors cannot be called clean.
+        ambiguous_sample_id = audit_a.evidence[0].training_sample_id
+        scenario_artifact_dir = artifact_dir / "scenarios" / "synthetic-memorization-v2"
+        split = json.loads((scenario_artifact_dir / "split_manifest.json").read_text())
+        non_eval_source_id = split["train_source_record_ids"][0]
+        graph.query(
+            "MATCH (sample:SampleVersion {id: $sample_id}) "
+            "MATCH (source:SourceRecord {id: $source_id}) "
+            "MERGE (sample)-[:DERIVED_FROM]->(source)",
+            params={"sample_id": ambiguous_sample_id, "source_id": non_eval_source_id},
+        )
+        try:
+            ambiguous_audit = store.audit("demo-v2-contaminated-a")
+            assert ambiguous_audit.status == "confirmed"
+            assert not ambiguous_audit.coverage_complete
+            assert ambiguous_audit.training_samples_with_ambiguous_source == 1
+        finally:
+            graph.query(
+                "MATCH (sample:SampleVersion {id: $sample_id})-"
+                "[edge:DERIVED_FROM]->(source:SourceRecord {id: $source_id}) "
+                "DELETE edge",
+                params={"sample_id": ambiguous_sample_id, "source_id": non_eval_source_id},
+            )
+
+        unresolved_parent_id = "sample:synthetic-memorization-v2:unknown"
+        graph.query(
+            "MATCH (sample:SampleVersion {id: $sample_id}) "
+            "MATCH (parent:SampleVersion {id: $parent_id}) "
+            "MERGE (sample)-[:DERIVED_FROM]->(parent)",
+            params={"sample_id": ambiguous_sample_id, "parent_id": unresolved_parent_id},
+        )
+        try:
+            incomplete_audit = store.audit("demo-v2-contaminated-a")
+            assert incomplete_audit.status == "confirmed"
+            assert not incomplete_audit.coverage_complete
+            assert incomplete_audit.training_samples_without_source == 0
+            assert incomplete_audit.training_samples_with_ambiguous_source == 0
+            assert incomplete_audit.training_samples_with_incomplete_lineage == 1
+        finally:
+            graph.query(
+                "MATCH (sample:SampleVersion {id: $sample_id})-"
+                "[edge:DERIVED_FROM]->(parent:SampleVersion {id: $parent_id}) "
+                "DELETE edge",
+                params={"sample_id": ambiguous_sample_id, "parent_id": unresolved_parent_id},
+            )
+
+        clean = audits["demo-v2-clean-control"]
         assert clean.status == "clean_within_recorded_lineage"
         assert clean.coverage_complete
         assert clean.training_manifest_verified
@@ -207,7 +268,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         assert clean.source_artifact_verified
         assert clean.evidence == ()
 
-        unknown = audits["demo-unknown-lineage"]
+        unknown = audits["demo-v2-unknown-lineage"]
         assert unknown.status == "unknown"
         assert not unknown.coverage_complete
         assert unknown.training_samples_without_source == 1
@@ -218,8 +279,8 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         # The exact lineage traversal must still find affected runs when both
         # denormalized dataset family labels are missing or stale.
         stale_dataset_ids = {
-            "dataset:train-contaminated-a-v1",
-            "dataset:eval-v1",
+            "dataset:synthetic-memorization-v2:train-contaminated-a",
+            "dataset:synthetic-memorization-v2:eval",
         }
         for dataset_id in stale_dataset_ids:
             graph.query(
@@ -230,7 +291,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         try:
             candidates_with_stale_index = store.list_source_family_runs(source_record_id)
             stale_a_run_ids = {
-                run["run_id"] for run in runs if run["experiment_id"] == "demo-contaminated-a"
+                run["run_id"] for run in runs if run["experiment_id"] == "demo-v2-contaminated-a"
             }
             assert stale_a_run_ids <= {
                 candidate.run_id for candidate in candidates_with_stale_index
@@ -250,7 +311,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
                     "SET dataset.source_family_id = $source_family",
                     params={
                         "dataset_id": dataset_id,
-                        "source_family": "synthetic-classification-v1",
+                        "source_family": "synthetic-memorization-v2",
                     },
                 )
 
@@ -292,8 +353,8 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         assert impact["coverage_complete"]
         impacted_runs = impact["impacted_runs"]
         assert {run["experiment_id"] for run in impacted_runs} == {
-            "demo-contaminated-a",
-            "demo-contaminated-b",
+            "demo-v2-contaminated-a",
+            "demo-v2-contaminated-b",
         }
         assert len(impacted_runs) == 4
         assert all(run["integrity_status"] == "suspect" for run in impacted_runs)
@@ -366,7 +427,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
 
         source_rows_for_control = [
             json.loads(line)
-            for line in (artifact_dir / "source_records.jsonl")
+            for line in (scenario_artifact_dir / "source_records.jsonl")
             .read_text(encoding="utf-8")
             .splitlines()
         ]
@@ -392,18 +453,22 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
         )
         assert blocked_proposal.status_code == 409
 
-        clean_manifest_path = artifact_dir / "manifests" / "train-clean-control-v1.json"
+        clean_manifest_path = (
+            scenario_artifact_dir
+            / "manifests"
+            / "synthetic-memorization-v2_train-clean-control.json"
+        )
         original_manifest = clean_manifest_path.read_text(encoding="utf-8")
         clean_manifest_path.write_text(
             original_manifest.replace("sample_ids", "sample_ids_changed"), encoding="utf-8"
         )
-        manifest_drift = store.audit("demo-clean-control")
+        manifest_drift = store.audit("demo-v2-clean-control")
         assert manifest_drift.status == "unknown"
         assert not manifest_drift.coverage_complete
         assert not manifest_drift.training_manifest_verified
 
         clean_manifest_path.write_text(original_manifest, encoding="utf-8")
-        source_path = artifact_dir / "source_records.jsonl"
+        source_path = scenario_artifact_dir / "source_records.jsonl"
         source_rows = [
             json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()
         ]
@@ -412,7 +477,7 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
             "\n".join(json.dumps(row, sort_keys=True) for row in source_rows) + "\n",
             encoding="utf-8",
         )
-        source_drift = store.audit("demo-clean-control")
+        source_drift = store.audit("demo-v2-clean-control")
         assert source_drift.status == "unknown"
         assert not source_drift.coverage_complete
         assert not source_drift.source_artifact_verified

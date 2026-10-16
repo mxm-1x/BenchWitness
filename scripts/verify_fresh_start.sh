@@ -30,6 +30,7 @@ compose up -d --wait
 echo "Checking the new graph, then seeding and measuring the synthetic demo"
 uv sync --locked
 npm ci --prefix apps/web
+npm ci --prefix apps/site
 uv run benchwitness-graph-health
 uv run benchwitness-seed-demo
 uv run benchwitness-run-demo
@@ -46,7 +47,7 @@ for attempt in $(seq 1 30); do
   fi
   sleep 1
 done
-uv run python -c 'from benchwitness_api.graph_lineage import GraphLineageStore; from benchwitness_api.settings import GraphSettings; store = GraphLineageStore(GraphSettings.from_env()); assert len(store.list_demo_experiment_ids()) == 4; assert store.audit("demo-contaminated-a").status == "confirmed"; assert store.audit("demo-clean-control").status == "clean_within_recorded_lineage"; print("FalkorDB restart persistence verified")'
+uv run python -c 'from benchwitness_api.graph_lineage import GraphLineageStore; from benchwitness_api.settings import GraphSettings; store = GraphLineageStore(GraphSettings.from_env()); assert len(store.list_demo_experiment_ids()) == 4; assert store.audit("demo-v2-contaminated-a").status == "confirmed"; assert store.audit("demo-v2-clean-control").status == "clean_within_recorded_lineage"; print("FalkorDB restart persistence verified")'
 
 echo "Running backend, integration, lint, type, and frontend production checks"
 uv run pytest -q
@@ -56,6 +57,7 @@ uv run mypy
 npm run lint --prefix apps/web
 npm run typecheck --prefix apps/web
 npm run build --prefix apps/web
+npm run check --prefix apps/site
 
 echo "Fresh-start verification passed. The test containers are stopped; the named graph volume is retained."
 echo "Remove only this isolated test volume later with: docker volume rm ${project}_falkordb_data"

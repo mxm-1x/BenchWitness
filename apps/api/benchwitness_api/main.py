@@ -65,6 +65,10 @@ class LineageAuditResponse(BaseModel):
     evaluation_dataset_id: str
     training_samples_without_source: int
     evaluation_samples_without_source: int
+    training_samples_with_ambiguous_source: int
+    evaluation_samples_with_ambiguous_source: int
+    training_samples_with_incomplete_lineage: int
+    evaluation_samples_with_incomplete_lineage: int
     training_manifest_verified: bool
     evaluation_manifest_verified: bool
     source_artifact_verified: bool
@@ -344,6 +348,10 @@ def _audit_response(result: AuditResult) -> LineageAuditResponse:
         evaluation_dataset_id=result.evaluation_dataset_id,
         training_samples_without_source=result.training_samples_without_source,
         evaluation_samples_without_source=result.evaluation_samples_without_source,
+        training_samples_with_ambiguous_source=result.training_samples_with_ambiguous_source,
+        evaluation_samples_with_ambiguous_source=result.evaluation_samples_with_ambiguous_source,
+        training_samples_with_incomplete_lineage=result.training_samples_with_incomplete_lineage,
+        evaluation_samples_with_incomplete_lineage=result.evaluation_samples_with_incomplete_lineage,
         training_manifest_verified=result.training_manifest_verified,
         evaluation_manifest_verified=result.evaluation_manifest_verified,
         source_artifact_verified=result.source_artifact_verified,
@@ -452,6 +460,14 @@ def evaluate_demo(
 ) -> DemoEvaluationResponse | JSONResponse:
     try:
         runs = runner.run_all()
+    except KeyError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "demo_not_seeded",
+                "message": "Seed the demo graph before evaluation",
+            },
+        )
     except EvaluationBlocked as exc:
         return JSONResponse(
             status_code=409,

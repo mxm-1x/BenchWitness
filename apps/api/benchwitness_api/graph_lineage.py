@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ from typing import Any, Literal
 from falkordb import FalkorDB  # type: ignore[import-untyped]
 
 from benchwitness_api.lineage import (
+    DEMO_EXPERIMENTS,
     DemoScenario,
     dataset_manifest_digest,
     source_records_digest,
@@ -90,11 +93,11 @@ MATCH (experiment:Experiment {id: $experiment_id})-[:TRAINS_ON]->(training:Datas
 MATCH (experiment)-[:TESTS_ON]->(evaluation:DatasetVersion)
 RETURN experiment.id, training.id, training.lineage_complete,
        evaluation.id, evaluation.lineage_complete
-LIMIT 1
+LIMIT 2
 """
 _LIST_DEMO_EXPERIMENT_IDS = """
 MATCH (experiment:Experiment)
-WHERE experiment.id STARTS WITH 'demo-'
+WHERE experiment.id IN $experiment_ids
 RETURN experiment.id
 ORDER BY experiment.id
 LIMIT 5
@@ -126,12 +129,26 @@ OPTIONAL MATCH (sample)-[:DERIVED_FROM*1..3]->(source:SourceRecord)
 RETURN sample.id, collect(DISTINCT source.id)
 LIMIT $limit
 """
-_COUNT_UNTRACED_SAMPLES = """
+_COUNT_INVALID_SOURCE_RESOLUTION = """
 MATCH (dataset:DatasetVersion {id: $dataset_id})
 OPTIONAL MATCH (dataset)-[:CONTAINS]->(sample:SampleVersion)
 OPTIONAL MATCH (sample)-[:DERIVED_FROM*1..3]->(source:SourceRecord)
 WITH sample, count(DISTINCT source) AS source_count
-WHERE sample IS NOT NULL AND source_count = 0
+RETURN sum(CASE WHEN sample IS NOT NULL AND source_count = 0 THEN 1 ELSE 0 END),
+       sum(CASE WHEN sample IS NOT NULL AND source_count > 1 THEN 1 ELSE 0 END)
+"""
+_COUNT_INCOMPLETE_LINEAGE_SAMPLES = """
+MATCH (dataset:DatasetVersion {id: $dataset_id})
+OPTIONAL MATCH (dataset)-[:CONTAINS]->(sample:SampleVersion)
+OPTIONAL MATCH (sample)-[:DERIVED_FROM]->(parent)
+OPTIONAL MATCH (parent)-[:DERIVED_FROM*0..3]->(source:SourceRecord)
+WITH sample, parent, count(DISTINCT source) AS parent_source_count
+WITH sample, count(DISTINCT parent) AS parent_count,
+     sum(CASE WHEN parent IS NOT NULL AND parent_source_count <> 1 THEN 1 ELSE 0 END)
+       AS unresolved_parent_count
+WHERE sample IS NOT NULL
+  AND (sample.lineage_complete IS NULL OR sample.lineage_complete <> true
+       OR parent_count = 0 OR unresolved_parent_count > 0)
 RETURN count(sample)
 """
 _FIND_OVERLAPS = """
@@ -440,6 +457,13 @@ SET job.status = $status, job.started_at = $started_at,
     job.repaired_run_ids = $repaired_run_ids
 RETURN job.id
 """
+_FAIL_STALE_RECOVERY_JOB = """
+MATCH (job:RecoveryJob {id: $job_id})
+WHERE job.status = 'running' AND job.started_at = $expected_started_at
+SET job.status = 'failed', job.finished_at = $finished_at,
+    job.error = 'worker_timeout:stale_running_job'
+RETURN job.id
+"""
 _LINK_RECOVERY_RUN = """
 MATCH (job:RecoveryJob {id: $job_id})
 MATCH (original:ExperimentRun {id: $original_run_id})
@@ -539,6 +563,10 @@ class AuditResult:
     evaluation_dataset_id: str
     training_samples_without_source: int
     evaluation_samples_without_source: int
+    training_samples_with_ambiguous_source: int
+    evaluation_samples_with_ambiguous_source: int
+    training_samples_with_incomplete_lineage: int
+    evaluation_samples_with_incomplete_lineage: int
     training_manifest_verified: bool
     evaluation_manifest_verified: bool
     source_artifact_verified: bool
@@ -555,6 +583,7 @@ class ResolvedSample:
 class ResolvedDataset:
     dataset_id: str
     role: str
+    source_family_id: str
     source_manifest_hash: str
     source_record_count: int
     samples: tuple[ResolvedSample, ...]
@@ -730,8 +759,8 @@ class GraphLineageStore:
             tuple(
                 {
                     "id": record.source_record_id,
-                    "family_id": "synthetic-classification-v1",
-                    "source_version": "v1",
+                    "family_id": scenario.source_family_id,
+                    "source_version": scenario.source_family_id,
                 }
                 for record in scenario.source_records
             ),
@@ -746,7 +775,7 @@ class GraphLineageStore:
                     "manifest_hash": manifest.digest,
                     "sample_count": len(manifest.sample_ids),
                     "lineage_complete": manifest.lineage_complete,
-                    "source_family_id": "synthetic-classification-v1",
+                    "source_family_id": scenario.source_family_id,
                     "source_manifest_hash": scenario.source_digest,
                     "source_record_count": len(scenario.source_records),
                 }
@@ -774,11 +803,17 @@ class GraphLineageStore:
             rows = self._query(_GET_EXPERIMENT, {"experiment_id": experiment_id})
             if not rows:
                 raise KeyError(experiment_id)
+            if len(rows) != 1 or len(rows[0]) != 5:
+                raise LineageGraphError(
+                    "experiment must resolve to exactly one training/evaluation pair"
+                )
             row = rows[0]
+            if type(row[2]) is not bool or type(row[4]) is not bool:
+                raise LineageGraphError("FalkorDB returned invalid experiment lineage status")
             training_dataset_id = str(row[1])
-            training_complete = bool(row[2])
+            training_complete = row[2]
             evaluation_dataset_id = str(row[3])
-            evaluation_complete = bool(row[4])
+            evaluation_complete = row[4]
             training_verification = self._verify_dataset_manifest(training_dataset_id)
             evaluation_verification = self._verify_dataset_manifest(evaluation_dataset_id)
             training_manifest_verified = training_verification[0]
@@ -787,8 +822,14 @@ class GraphLineageStore:
                 self._verify_source_artifact(training_verification[2:5])
                 and training_verification[2:5] == evaluation_verification[2:5]
             )
-            training_untraced = self._count_untraced(training_dataset_id)
-            evaluation_untraced = self._count_untraced(evaluation_dataset_id)
+            training_untraced, training_ambiguous = self._count_invalid_source_resolution(
+                training_dataset_id
+            )
+            evaluation_untraced, evaluation_ambiguous = self._count_invalid_source_resolution(
+                evaluation_dataset_id
+            )
+            training_incomplete = self._count_incomplete_lineage_samples(training_dataset_id)
+            evaluation_incomplete = self._count_incomplete_lineage_samples(evaluation_dataset_id)
             raw_evidence = self._query(
                 _FIND_OVERLAPS,
                 {"experiment_id": experiment_id, "limit": _MAX_EVIDENCE_PATHS + 1},
@@ -821,6 +862,10 @@ class GraphLineageStore:
             and source_artifact_verified
             and training_untraced == 0
             and evaluation_untraced == 0
+            and training_ambiguous == 0
+            and evaluation_ambiguous == 0
+            and training_incomplete == 0
+            and evaluation_incomplete == 0
             and not truncated
         )
         if evidence:
@@ -837,6 +882,10 @@ class GraphLineageStore:
             evaluation_dataset_id=evaluation_dataset_id,
             training_samples_without_source=training_untraced,
             evaluation_samples_without_source=evaluation_untraced,
+            training_samples_with_ambiguous_source=training_ambiguous,
+            evaluation_samples_with_ambiguous_source=evaluation_ambiguous,
+            training_samples_with_incomplete_lineage=training_incomplete,
+            evaluation_samples_with_incomplete_lineage=evaluation_incomplete,
             training_manifest_verified=training_manifest_verified,
             evaluation_manifest_verified=evaluation_manifest_verified,
             source_artifact_verified=source_artifact_verified,
@@ -845,16 +894,14 @@ class GraphLineageStore:
 
     def list_demo_experiment_ids(self) -> tuple[str, ...]:
         """Discover only the fixed demo experiment family from FalkorDB."""
-        rows = self._query(_LIST_DEMO_EXPERIMENT_IDS)
+        rows = self._query(_LIST_DEMO_EXPERIMENT_IDS, {"experiment_ids": list(DEMO_EXPERIMENTS)})
         if len(rows) > 4 or any(len(row) != 1 for row in rows):
             raise LineageGraphError("FalkorDB returned an invalid demo experiment list")
         return tuple(str(row[0]) for row in rows)
 
     def list_run_summaries(self) -> tuple[ExperimentRunSummary, ...]:
         """Return at most 100 minimal run summaries without reading artifact paths."""
-        rows = self._query(_LIST_RUN_SUMMARIES, {"limit": 101})
-        if len(rows) > 100:
-            raise LineageGraphError("measured run list exceeds the 100-run bound")
+        rows = self._query(_LIST_RUN_SUMMARIES, {"limit": 100})
         if any(len(row) != 8 for row in rows):
             raise LineageGraphError("FalkorDB returned an invalid run summary")
         summaries: list[ExperimentRunSummary] = []
@@ -879,7 +926,9 @@ class GraphLineageStore:
             raise LineageGraphError("FalkorDB returned invalid dataset manifest data")
         row = rows[0]
         role = str(row[1])
-        lineage_complete = bool(row[2])
+        if type(row[2]) is not bool:
+            raise LineageGraphError("FalkorDB returned invalid dataset lineage status")
+        lineage_complete = row[2]
         declared_count = int(row[3])
         graph_digest = str(row[4])
         raw_sample_ids = row[5] or []
@@ -900,15 +949,26 @@ class GraphLineageStore:
                 declared_count,
             )
 
+        scenario_artifact_dir = self._artifact_dir_for_family(source_family_id)
+        if scenario_artifact_dir is None:
+            return (
+                False,
+                role,
+                source_family_id,
+                source_manifest_hash,
+                source_record_count,
+                declared_count,
+            )
         safe_name = dataset_id.removeprefix("dataset:").replace(":", "_")
-        manifest_path = self._artifact_dir / "manifests" / f"{safe_name}.json"
+        manifest_path = scenario_artifact_dir / "manifests" / f"{safe_name}.json"
         try:
             artifact_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             artifact_sample_ids = artifact_manifest["sample_ids"]
             manifest_verified = (
                 artifact_manifest["dataset_id"] == dataset_id
                 and artifact_manifest["role"] == role
-                and bool(artifact_manifest["lineage_complete"]) == lineage_complete
+                and type(artifact_manifest["lineage_complete"]) is bool
+                and artifact_manifest["lineage_complete"] == lineage_complete
                 and isinstance(artifact_sample_ids, list)
                 and tuple(sorted(str(sample_id) for sample_id in artifact_sample_ids)) == sample_ids
                 and artifact_manifest["manifest_hash"] == graph_digest
@@ -936,8 +996,11 @@ class GraphLineageStore:
         if not isinstance(raw_graph_ids, list):
             raise LineageGraphError("FalkorDB returned invalid source record IDs")
         try:
+            scenario_artifact_dir = self._artifact_dir_for_family(family_id)
+            if scenario_artifact_dir is None:
+                return False
             source_lines = (
-                (self._artifact_dir / "source_records.jsonl")
+                (scenario_artifact_dir / "source_records.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
             )
@@ -953,6 +1016,13 @@ class GraphLineageStore:
             and sorted(source_ids) == graph_ids
             and artifact_digest == expected_digest
         )
+
+    def _artifact_dir_for_family(self, family_id: str) -> Path | None:
+        if family_id == "synthetic-classification-v1":
+            return self._artifact_dir
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", family_id):
+            return None
+        return self._artifact_dir / "scenarios" / family_id
 
     def resolve_dataset(
         self, dataset_id: str, expected_role: Literal["training", "evaluation"]
@@ -987,6 +1057,7 @@ class GraphLineageStore:
         return ResolvedDataset(
             dataset_id=dataset_id,
             role=expected_role,
+            source_family_id=verification[2],
             source_manifest_hash=verification[3],
             source_record_count=verification[4],
             samples=tuple(sorted(resolved, key=lambda sample: sample.sample_id)),
@@ -999,6 +1070,23 @@ class GraphLineageStore:
         rows = self._query(_RECORD_RUN, params)
         if rows != [[record.run_id]]:
             raise LineageGraphError("FalkorDB did not persist the experiment run and dataset edges")
+        persisted = self.get_run(record.run_id)
+        float_fields = {"accuracy", "precision", "recall", "f1"}
+        mismatches = [
+            name
+            for name in record.__dict__
+            if (
+                not math.isclose(
+                    record.__dict__[name], persisted.__dict__[name], rel_tol=1e-12, abs_tol=1e-12
+                )
+                if name in float_fields
+                else record.__dict__[name] != persisted.__dict__[name]
+            )
+        ]
+        if mismatches:
+            raise LineageGraphError(
+                f"persisted experiment run differs from its measured artifact: {mismatches}"
+            )
 
     def get_run(self, run_id: str) -> ExperimentRunRecord:
         """Read a persisted experiment run through a fixed query template."""
@@ -1493,20 +1581,48 @@ class GraphLineageStore:
         status: str,
         *,
         error: str | None = None,
-        repaired_run_ids: tuple[str, ...] = (),
+        repaired_run_ids: tuple[str, ...] | None = None,
     ) -> bool:
+        allowed_transitions = {
+            ("pending_enqueue", "queued"),
+            ("queued", "running"),
+            ("queued", "failed"),
+            ("running", "failed"),
+            ("running", "succeeded"),
+            ("failed", "queued"),
+        }
+        if (expected, status) not in allowed_transitions:
+            return False
         current = self.get_recovery_job(job_id)
         now = datetime.now(UTC).isoformat(timespec="milliseconds")
+        retained_run_ids = list(current.repaired_run_ids)
+        retained_run_ids.extend(repaired_run_ids or ())
         rows = self._query(
             _SET_RECOVERY_JOB_STATUS,
             {
                 "job_id": job_id,
                 "expected_status": expected,
                 "status": status,
-                "started_at": now if status == "running" else current.started_at,
+                "started_at": now
+                if status == "running"
+                else None
+                if status == "queued"
+                else current.started_at,
                 "finished_at": now if status in ("succeeded", "failed") else None,
-                "error": error,
-                "repaired_run_ids": list(repaired_run_ids),
+                "error": error if status == "failed" else None,
+                "repaired_run_ids": list(dict.fromkeys(retained_run_ids)),
+            },
+        )
+        return rows == [[job_id]]
+
+    def fail_stale_recovery_job(self, job_id: str, started_at: str) -> bool:
+        """Fail a timed-out running attempt only if its start timestamp is unchanged."""
+        rows = self._query(
+            _FAIL_STALE_RECOVERY_JOB,
+            {
+                "job_id": job_id,
+                "expected_started_at": started_at,
+                "finished_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
             },
         )
         return rows == [[job_id]]
@@ -1618,8 +1734,14 @@ class GraphLineageStore:
         if rows != [[memory_id]]:
             raise LineageGraphError("FalkorDB did not link recalled memory to the session")
 
-    def _count_untraced(self, dataset_id: str) -> int:
-        rows = self._query(_COUNT_UNTRACED_SAMPLES, {"dataset_id": dataset_id})
-        if len(rows) != 1 or len(rows[0]) != 1:
+    def _count_invalid_source_resolution(self, dataset_id: str) -> tuple[int, int]:
+        rows = self._query(_COUNT_INVALID_SOURCE_RESOLUTION, {"dataset_id": dataset_id})
+        if len(rows) != 1 or len(rows[0]) != 2:
             raise LineageGraphError("FalkorDB returned invalid lineage coverage data")
-        return int(rows[0][0])
+        return int(rows[0][0] or 0), int(rows[0][1] or 0)
+
+    def _count_incomplete_lineage_samples(self, dataset_id: str) -> int:
+        rows = self._query(_COUNT_INCOMPLETE_LINEAGE_SAMPLES, {"dataset_id": dataset_id})
+        if len(rows) != 1 or len(rows[0]) != 1:
+            raise LineageGraphError("FalkorDB returned invalid lineage completeness data")
+        return int(rows[0][0] or 0)

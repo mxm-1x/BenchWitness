@@ -31,7 +31,7 @@ def test_new_agent_session_recalls_verified_memory_then_reinvestigates_stale_mem
         DemoSeedService(store, artifact_dir).seed()
         runner = DemoEvaluationRunner(store, artifact_dir)
         runner.run_all()
-        source = store.audit("demo-contaminated-a").evidence[0].canonical_source_record_id
+        source = store.audit("demo-v2-contaminated-a").evidence[0].canonical_source_record_id
         client = TestClient(app)
         assert client.post("/api/v1/agent/sessions").status_code == 401
 
@@ -58,8 +58,12 @@ def test_new_agent_session_recalls_verified_memory_then_reinvestigates_stale_mem
         assert len(first_data["investigation"]["impacted_runs"]) == 2
         for run in first_data["investigation"]["impacted_runs"]:
             for evidence in run["evidence"]:
-                assert evidence["training_sample_id"].startswith("sample:copy:")
-                assert evidence["evaluation_sample_id"].startswith("sample:source-v1:")
+                assert evidence["training_sample_id"].startswith(
+                    "sample:synthetic-memorization-v2:copy:"
+                )
+                assert evidence["evaluation_sample_id"].startswith(
+                    "sample:synthetic-memorization-v2:source:"
+                )
         assert first_data["memory_id"] is not None
 
         # A new service instance and session have no Python conversation state.
@@ -88,7 +92,7 @@ def test_new_agent_session_recalls_verified_memory_then_reinvestigates_stale_mem
         clean = client.post(
             f"/api/v1/agent/sessions/{second_session}/messages",
             headers=headers,
-            json={"intent": "audit_experiment", "subject_id": "demo-clean-control"},
+            json={"intent": "audit_experiment", "subject_id": "demo-v2-clean-control"},
         )
         assert clean.status_code == 200
         assert clean.json()["audit"]["status"] == "clean_within_recorded_lineage"

@@ -21,9 +21,9 @@ class SmokeSeedService:
     def seed(self) -> dict[str, object]:
         return {
             "source_records_processed": 400,
-            "sample_versions_processed": 403,
-            "dataset_versions": ["dataset:eval-v1"],
-            "experiments": ["demo-contaminated-a"],
+            "sample_versions_processed": 441,
+            "dataset_versions": ["dataset:synthetic-memorization-v2:eval"],
+            "experiments": ["demo-v2-contaminated-a"],
             "source_manifest_hash": "a" * 64,
             "split_manifest_hash": "b" * 64,
             "artifact_directory": "artifacts/demo",
@@ -36,21 +36,27 @@ class SmokeLineageStore:
             experiment_id=experiment_id,
             status="confirmed",
             coverage_complete=True,
-            training_dataset_id="dataset:train-contaminated-a-v1",
-            evaluation_dataset_id="dataset:eval-v1",
+            training_dataset_id="dataset:synthetic-memorization-v2:train-contaminated-a",
+            evaluation_dataset_id="dataset:synthetic-memorization-v2:eval",
             training_samples_without_source=0,
             evaluation_samples_without_source=0,
+            training_samples_with_ambiguous_source=0,
+            evaluation_samples_with_ambiguous_source=0,
+            training_samples_with_incomplete_lineage=0,
+            evaluation_samples_with_incomplete_lineage=0,
             training_manifest_verified=True,
             evaluation_manifest_verified=True,
             source_artifact_verified=True,
             evidence=(
                 AuditEvidence(
-                    canonical_source_record_id="source:synthetic-v1:0012",
-                    training_dataset_id="dataset:train-contaminated-a-v1",
-                    training_sample_id="sample:copy:demo-contaminated-a:0012",
+                    canonical_source_record_id="source:synthetic-memorization-v2:0012",
+                    training_dataset_id="dataset:synthetic-memorization-v2:train-contaminated-a",
+                    training_sample_id=(
+                        "sample:synthetic-memorization-v2:copy:demo-v2-contaminated-a:0012"
+                    ),
                     training_derivation_hops=2,
-                    evaluation_dataset_id="dataset:eval-v1",
-                    evaluation_sample_id="sample:source-v1:0012",
+                    evaluation_dataset_id="dataset:synthetic-memorization-v2:eval",
+                    evaluation_sample_id="sample:synthetic-memorization-v2:source:0012",
                     evaluation_derivation_hops=1,
                 ),
             ),
@@ -98,7 +104,7 @@ def test_seed_and_lineage_audit_api_smoke(monkeypatch: pytest.MonkeyPatch) -> No
             "/api/v1/demo/seed",
             headers={"Authorization": f"Bearer {api_token}"},
         )
-        audit = client.get("/api/v1/experiments/demo-contaminated-a/lineage-audit")
+        audit = client.get("/api/v1/experiments/demo-v2-contaminated-a/lineage-audit")
     finally:
         app.dependency_overrides.clear()
 
@@ -107,5 +113,5 @@ def test_seed_and_lineage_audit_api_smoke(monkeypatch: pytest.MonkeyPatch) -> No
     assert audit.status_code == 200
     assert audit.json()["status"] == "confirmed"
     evidence = audit.json()["evidence"][0]
-    assert evidence["canonical_source_record_id"] == "source:synthetic-v1:0012"
+    assert evidence["canonical_source_record_id"] == "source:synthetic-memorization-v2:0012"
     assert evidence["training_derivation_hops"] == 2

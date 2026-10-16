@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from redis import Redis
 from rq import Queue
@@ -14,6 +16,9 @@ from benchwitness_api.graph_lineage import (
     QuarantineActionRecord,
     RecoveryJobRecord,
 )
+
+REPAIR_JOB_TIMEOUT_SECONDS = 300
+REPAIR_JOB_STALE_GRACE_SECONDS = 60
 
 
 class RecoveryService:
@@ -30,18 +35,26 @@ class RecoveryService:
         original_ids = tuple(sorted(run.run_id for run in investigation.impacted_runs))
         if not original_ids:
             raise ActionNotAllowed("repair has no measured impacted runs")
-        job = self._graph.create_recovery_job(action_id, original_ids)
-        if job.status != "pending_enqueue":
+        job = self._mark_stale_if_needed(self._graph.create_recovery_job(action_id, original_ids))
+        if job.status in ("queued", "running", "succeeded"):
             return job
-        if not self._graph.transition_recovery_job(job.job_id, "pending_enqueue", "queued"):
+        expected_status = job.status
+        if expected_status not in ("pending_enqueue", "failed"):
+            return job
+        if not self._graph.transition_recovery_job(job.job_id, expected_status, "queued"):
             return self._graph.get_recovery_job(job.job_id)
         try:
-            broker_job_id = "bw-repair-" + hashlib.sha256(job.job_id.encode()).hexdigest()
+            broker_job_id = (
+                "bw-repair-"
+                + hashlib.sha256(job.job_id.encode()).hexdigest()[:20]
+                + "-"
+                + uuid4().hex[:12]
+            )
             self._queue.enqueue(
                 "benchwitness_ml.recovery_worker.run_recovery_job",
                 job.job_id,
                 job_id=broker_job_id,
-                job_timeout=300,
+                job_timeout=REPAIR_JOB_TIMEOUT_SECONDS,
                 result_ttl=60,
                 failure_ttl=3600,
             )
@@ -53,7 +66,22 @@ class RecoveryService:
         return self._graph.get_recovery_job(job.job_id)
 
     def get_job(self, job_id: str) -> RecoveryJobRecord:
-        return self._graph.get_recovery_job(job_id)
+        return self._mark_stale_if_needed(self._graph.get_recovery_job(job_id))
+
+    def _mark_stale_if_needed(self, job: RecoveryJobRecord) -> RecoveryJobRecord:
+        if job.status != "running" or not job.started_at:
+            return job
+        try:
+            started_at = datetime.fromisoformat(job.started_at)
+        except ValueError:
+            return job
+        if started_at.tzinfo is None:
+            return job
+        age = (datetime.now(UTC) - started_at.astimezone(UTC)).total_seconds()
+        if age <= REPAIR_JOB_TIMEOUT_SECONDS + REPAIR_JOB_STALE_GRACE_SECONDS:
+            return job
+        self._graph.fail_stale_recovery_job(job.job_id, job.started_at)
+        return self._graph.get_recovery_job(job.job_id)
 
 
 class RecoveryQueueUnavailable(RuntimeError):

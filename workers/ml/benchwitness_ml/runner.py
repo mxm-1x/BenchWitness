@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import platform
+import re
+import shutil
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,13 +20,9 @@ from benchwitness_api.graph_lineage import (
     GraphLineageStore,
     ResolvedDataset,
 )
-from benchwitness_api.lineage import source_records_digest
+from benchwitness_api.lineage import DEMO_EXPERIMENTS, source_records_digest
 
-_DEMO_EXPERIMENTS = (
-    "demo-contaminated-a",
-    "demo-contaminated-b",
-    "demo-clean-control",
-)
+_DEMO_EXPERIMENTS = DEMO_EXPERIMENTS[:3]
 _MODEL_ID = "1nn-euclidean-v1"
 _MODEL_CONFIG = {
     "algorithm": "1-nearest-neighbor",
@@ -82,7 +82,7 @@ class DemoEvaluationRunner:
     def run_all(self) -> list[ExperimentRunRecord]:
         runs: list[ExperimentRunRecord] = []
         source_rows: dict[str, SourceRow] | None = None
-        verified_source_hash: str | None = None
+        verified_source_identity: tuple[str, str] | None = None
         for experiment_id in _DEMO_EXPERIMENTS:
             audit = self._graph.audit(experiment_id)
             if not audit.coverage_complete or audit.status not in (
@@ -102,11 +102,14 @@ class DemoEvaluationRunner:
                 raise EvaluationBlocked(
                     "training and evaluation datasets use different source manifests"
                 )
-            if verified_source_hash != training.source_manifest_hash:
+            source_identity = (training.source_family_id, training.source_manifest_hash)
+            if verified_source_identity != source_identity:
                 source_rows = self._load_source_rows(
-                    training.source_manifest_hash, training.source_record_count
+                    training.source_family_id,
+                    training.source_manifest_hash,
+                    training.source_record_count,
                 )
-                verified_source_hash = training.source_manifest_hash
+                verified_source_identity = source_identity
             if source_rows is None:
                 raise EvaluationBlocked("verified source rows could not be loaded")
 
@@ -143,9 +146,17 @@ class DemoEvaluationRunner:
             or original.evaluation_dataset_id != contaminated_audit.evaluation_dataset_id
         ):
             raise EvaluationBlocked("original run does not have verified contaminated lineage")
-        clean = self._graph.resolve_dataset("dataset:train-clean-control-v1", "training")
+        original_training = self._graph.resolve_dataset(original.training_dataset_id, "training")
+        clean_dataset_id = f"dataset:{original_training.source_family_id}:train-clean-control"
+        clean = self._graph.resolve_dataset(clean_dataset_id, "training")
         evaluation = self._graph.resolve_dataset(original.evaluation_dataset_id, "evaluation")
-        split_path = self._artifact_dir / "split_manifest.json"
+        if (
+            clean.source_family_id != original_training.source_family_id
+            or clean.source_manifest_hash != evaluation.source_manifest_hash
+        ):
+            raise EvaluationBlocked("clean recovery split belongs to a different source family")
+        scenario_artifact_dir = self._scenario_artifact_dir(clean.source_family_id)
+        split_path = scenario_artifact_dir / "split_manifest.json"
         try:
             split = json.loads(split_path.read_text(encoding="utf-8"))
             train_ids = {sample.source_record_id for sample in clean.samples}
@@ -160,7 +171,9 @@ class DemoEvaluationRunner:
                 raise EvaluationBlocked("clean split does not match verified graph memberships")
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise EvaluationBlocked("clean split artifact is invalid") from exc
-        source_rows = self._load_source_rows(clean.source_manifest_hash, clean.source_record_count)
+        source_rows = self._load_source_rows(
+            clean.source_family_id, clean.source_manifest_hash, clean.source_record_count
+        )
         training_samples = self._materialize(clean, source_rows)
         evaluation_samples = self._materialize(evaluation, source_rows)
         predictions = self._predict(training_samples, evaluation_samples)
@@ -196,8 +209,17 @@ class DemoEvaluationRunner:
         )
         return self._graph.get_run(run_id), model_sha256
 
-    def _load_source_rows(self, expected_digest: str, expected_count: int) -> dict[str, SourceRow]:
-        source_path = self._artifact_dir / "source_records.jsonl"
+    def _scenario_artifact_dir(self, source_family_id: str) -> Path:
+        if source_family_id == "synthetic-classification-v1":
+            return self._artifact_dir
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", source_family_id):
+            raise EvaluationBlocked("source family ID is not a safe artifact namespace")
+        return self._artifact_dir / "scenarios" / source_family_id
+
+    def _load_source_rows(
+        self, source_family_id: str, expected_digest: str, expected_count: int
+    ) -> dict[str, SourceRow]:
+        source_path = self._scenario_artifact_dir(source_family_id) / "source_records.jsonl"
         try:
             raw_rows = [
                 json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()
@@ -217,7 +239,14 @@ class DemoEvaluationRunner:
                 if (
                     not isinstance(raw_features, list)
                     or len(raw_features) != 2
+                    or type(label) is not int
                     or label not in (0, 1)
+                    or not all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
+                        for value in raw_features
+                    )
                     or source_id in source_rows
                 ):
                     raise EvaluationBlocked("source artifact contains an invalid or duplicate row")
@@ -322,8 +351,8 @@ class DemoEvaluationRunner:
         model_bytes: bytes | None = None,
     ) -> ExperimentRunRecord:
         run_id = run_id or f"run-{experiment_id}-{uuid4().hex}"
-        created_at = datetime.now(UTC).isoformat(timespec="milliseconds")
-        python_version = platform.python_version()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,199}", run_id):
+            raise EvaluationBlocked("run ID is not a safe artifact name")
         prediction_bytes = b"".join(
             (json.dumps(asdict(prediction), sort_keys=True, separators=(",", ":")) + "\n").encode(
                 "utf-8"
@@ -332,42 +361,99 @@ class DemoEvaluationRunner:
         )
         prediction_sha256 = hashlib.sha256(prediction_bytes).hexdigest()
         model_config = json.dumps(_MODEL_CONFIG, sort_keys=True, separators=(",", ":"))
-        artifact_dir = self._artifact_dir / "runs" / run_id
-        artifact_dir.mkdir(parents=True, exist_ok=False)
-        prediction_path = artifact_dir / "predictions.jsonl"
-        self._write_atomic(prediction_path, prediction_bytes)
-        if model_bytes is not None:
-            self._write_atomic(artifact_dir / "model-training-rows.jsonl", model_bytes)
+        artifact_root = self._scenario_artifact_dir(training.source_family_id)
+        artifact_dir = artifact_root / "runs" / run_id
+        artifact_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        manifest_payload: dict[str, Any] = {
-            "run_id": run_id,
-            "experiment_id": experiment_id,
-            "model_id": _MODEL_ID,
-            "model_config": _MODEL_CONFIG,
-            "created_at": created_at,
-            "python_version": python_version,
-            "training_dataset_id": training.dataset_id,
-            "training_source_manifest_hash": training.source_manifest_hash,
-            "training_sample_count": training_sample_count,
-            "evaluation_dataset_id": evaluation.dataset_id,
-            "evaluation_source_manifest_hash": evaluation.source_manifest_hash,
-            "evaluation_sample_count": metrics.sample_count,
-            "metric_definition": "binary positive-class precision, recall, f1; unweighted accuracy",
-            "metrics": asdict(metrics),
-            "prediction_sha256": prediction_sha256,
-        }
-        if model_bytes is not None:
-            manifest_payload["model_sha256"] = hashlib.sha256(model_bytes).hexdigest()
-        manifest_bytes = json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        manifest_payload["manifest_sha256"] = manifest_sha256
-        manifest_path = artifact_dir / "manifest.json"
-        self._write_atomic(
-            manifest_path,
-            (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-        )
+        def manifest_for(created_at: str, python_version: str) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "run_id": run_id,
+                "experiment_id": experiment_id,
+                "model_id": _MODEL_ID,
+                "model_config": _MODEL_CONFIG,
+                "created_at": created_at,
+                "python_version": python_version,
+                "training_dataset_id": training.dataset_id,
+                "training_source_manifest_hash": training.source_manifest_hash,
+                "training_sample_count": training_sample_count,
+                "evaluation_dataset_id": evaluation.dataset_id,
+                "evaluation_source_manifest_hash": evaluation.source_manifest_hash,
+                "evaluation_sample_count": metrics.sample_count,
+                "metric_definition": "binary positive-class precision, recall, f1; unweighted accuracy",
+                "metrics": asdict(metrics),
+                "prediction_sha256": prediction_sha256,
+            }
+            if model_bytes is not None:
+                payload["model_sha256"] = hashlib.sha256(model_bytes).hexdigest()
+            return payload
+
+        def persist_or_reuse() -> tuple[str, str, str]:
+            if artifact_dir.exists():
+                try:
+                    stored = json.loads(
+                        (artifact_dir / "manifest.json").read_text(encoding="utf-8")
+                    )
+                    stored_hash = stored.pop("manifest_sha256")
+                    created_at = stored["created_at"]
+                    python_version = stored["python_version"]
+                    expected = manifest_for(created_at, python_version)
+                    manifest_hash = hashlib.sha256(
+                        json.dumps(expected, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    existing_predictions = (artifact_dir / "predictions.jsonl").read_bytes()
+                    valid = (
+                        stored == expected
+                        and stored_hash == manifest_hash
+                        and hashlib.sha256(existing_predictions).hexdigest() == prediction_sha256
+                        and existing_predictions == prediction_bytes
+                    )
+                    model_path = artifact_dir / "model-training-rows.jsonl"
+                    if model_bytes is not None:
+                        valid = valid and model_path.read_bytes() == model_bytes
+                    else:
+                        valid = valid and not model_path.exists()
+                    if not valid:
+                        raise EvaluationBlocked(
+                            "existing run artifacts do not match the measured retry"
+                        )
+                    return created_at, python_version, manifest_hash
+                except EvaluationBlocked:
+                    raise
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    raise EvaluationBlocked(
+                        "existing run artifacts are incomplete or invalid"
+                    ) from exc
+
+            created_at = datetime.now(UTC).isoformat(timespec="milliseconds")
+            python_version = platform.python_version()
+            payload = manifest_for(created_at, python_version)
+            manifest_hash = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            payload["manifest_sha256"] = manifest_hash
+            stage = Path(
+                tempfile.mkdtemp(prefix=f".{run_id}.", suffix=".tmp", dir=artifact_dir.parent)
+            )
+            try:
+                self._write_atomic(stage / "predictions.jsonl", prediction_bytes)
+                if model_bytes is not None:
+                    self._write_atomic(stage / "model-training-rows.jsonl", model_bytes)
+                self._write_atomic(
+                    stage / "manifest.json",
+                    (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                )
+                try:
+                    stage.rename(artifact_dir)
+                except OSError:
+                    if not artifact_dir.exists():
+                        raise
+                    return persist_or_reuse()
+            finally:
+                if stage.exists():
+                    shutil.rmtree(stage)
+            return created_at, python_version, manifest_hash
+
+        created_at, python_version, manifest_sha256 = persist_or_reuse()
 
         return ExperimentRunRecord(
             run_id=run_id,

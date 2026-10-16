@@ -18,6 +18,10 @@ export interface Audit {
   evaluation_dataset_id: string
   training_samples_without_source: number
   evaluation_samples_without_source: number
+  training_samples_with_ambiguous_source: number
+  evaluation_samples_with_ambiguous_source: number
+  training_samples_with_incomplete_lineage: number
+  evaluation_samples_with_incomplete_lineage: number
   training_manifest_verified: boolean
   evaluation_manifest_verified: boolean
   source_artifact_verified: boolean
@@ -33,6 +37,9 @@ export interface Run {
   training_sample_count: number
   evaluation_sample_count: number
   accuracy: number
+  precision?: number
+  recall?: number
+  f1?: number
 }
 
 export interface Overview {
