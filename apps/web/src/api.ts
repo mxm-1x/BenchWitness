@@ -29,18 +29,10 @@ export interface Run {
   experiment_id: string
   training_dataset_id: string
   evaluation_dataset_id: string
-  model_id: string
-  model_config_json: string
   created_at: string
   training_sample_count: number
   evaluation_sample_count: number
   accuracy: number
-  precision: number
-  recall: number
-  f1: number
-  prediction_sha256: string
-  manifest_sha256: string
-  artifact_path: string
 }
 
 export interface Overview {

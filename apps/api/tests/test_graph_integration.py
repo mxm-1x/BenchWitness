@@ -75,6 +75,21 @@ def test_real_graph_proves_overlap_clean_control_and_unknown_lineage(
             "demo-unknown-lineage",
         }
         assert {run["run_id"] for run in overview.json()["runs"]} == {run["run_id"] for run in runs}
+        assert all("artifact_path" not in run for run in overview.json()["runs"])
+        assert all(
+            set(run)
+            == {
+                "run_id",
+                "experiment_id",
+                "training_dataset_id",
+                "evaluation_dataset_id",
+                "created_at",
+                "training_sample_count",
+                "evaluation_sample_count",
+                "accuracy",
+            }
+            for run in overview.json()["runs"]
+        )
         assert (
             client.get(f"/api/v1/runs/{runs[0]['run_id']}").json()["accuracy"]
             == runs[0]["accuracy"]

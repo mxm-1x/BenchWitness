@@ -99,9 +99,20 @@ class DemoEvaluationResponse(BaseModel):
     runs: list[ExperimentRunResponse]
 
 
+class ExperimentRunSummaryResponse(BaseModel):
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    created_at: str
+    training_sample_count: int
+    evaluation_sample_count: int
+    accuracy: float
+
+
 class OverviewResponse(BaseModel):
     audits: list[LineageAuditResponse]
-    runs: list[ExperimentRunResponse]
+    runs: list[ExperimentRunSummaryResponse]
 
 
 class ImpactRequest(BaseModel):
@@ -414,7 +425,9 @@ def get_overview(
         ids = store.list_demo_experiment_ids()
         return OverviewResponse(
             audits=[_audit_response(store.audit(experiment_id)) for experiment_id in ids],
-            runs=[ExperimentRunResponse(**run.__dict__) for run in store.list_runs()],
+            runs=[
+                ExperimentRunSummaryResponse(**run.__dict__) for run in store.list_run_summaries()
+            ],
         )
     except LineageGraphError:
         return JSONResponse(status_code=503, content={"error": "graph_unavailable"})

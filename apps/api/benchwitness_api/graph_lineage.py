@@ -99,10 +99,13 @@ RETURN experiment.id
 ORDER BY experiment.id
 LIMIT 5
 """
-_LIST_RUN_IDS = """
-MATCH (run:ExperimentRun)
-RETURN run.id
-ORDER BY run.created_at DESC
+_LIST_RUN_SUMMARIES = """
+MATCH (experiment:Experiment)-[:HAS_RUN]->(run:ExperimentRun)
+MATCH (run)-[:TRAINED_ON]->(training:DatasetVersion)
+MATCH (run)-[:EVALUATED_ON]->(evaluation:DatasetVersion)
+RETURN run.id, experiment.id, training.id, evaluation.id, run.created_at,
+       run.training_sample_count, run.evaluation_sample_count, run.accuracy
+ORDER BY run.created_at DESC, run.id DESC
 LIMIT $limit
 """
 _GET_DATASET_MANIFEST = """
@@ -583,6 +586,20 @@ class ExperimentRunRecord:
 
 
 @dataclass(frozen=True)
+class ExperimentRunSummary:
+    """Minimal graph-backed fields needed for the browser overview."""
+
+    run_id: str
+    experiment_id: str
+    training_dataset_id: str
+    evaluation_dataset_id: str
+    created_at: str
+    training_sample_count: int
+    evaluation_sample_count: int
+    accuracy: float
+
+
+@dataclass(frozen=True)
 class RunCandidate:
     run_id: str
     experiment_id: str
@@ -833,12 +850,28 @@ class GraphLineageStore:
             raise LineageGraphError("FalkorDB returned an invalid demo experiment list")
         return tuple(str(row[0]) for row in rows)
 
-    def list_runs(self) -> tuple[ExperimentRunRecord, ...]:
-        """Return at most 100 measured runs, refusing a silently truncated list."""
-        rows = self._query(_LIST_RUN_IDS, {"limit": 101})
-        if len(rows) > 100 or any(len(row) != 1 for row in rows):
+    def list_run_summaries(self) -> tuple[ExperimentRunSummary, ...]:
+        """Return at most 100 minimal run summaries without reading artifact paths."""
+        rows = self._query(_LIST_RUN_SUMMARIES, {"limit": 101})
+        if len(rows) > 100:
             raise LineageGraphError("measured run list exceeds the 100-run bound")
-        return tuple(self.get_run(str(row[0])) for row in rows)
+        if any(len(row) != 8 for row in rows):
+            raise LineageGraphError("FalkorDB returned an invalid run summary")
+        summaries: list[ExperimentRunSummary] = []
+        for row in rows:
+            summaries.append(
+                ExperimentRunSummary(
+                    run_id=str(row[0]),
+                    experiment_id=str(row[1]),
+                    training_dataset_id=str(row[2]),
+                    evaluation_dataset_id=str(row[3]),
+                    created_at=str(row[4]),
+                    training_sample_count=int(row[5]),
+                    evaluation_sample_count=int(row[6]),
+                    accuracy=float(row[7]),
+                )
+            )
+        return tuple(summaries)
 
     def _verify_dataset_manifest(self, dataset_id: str) -> tuple[bool, str, str, str, int, int]:
         rows = self._query(_GET_DATASET_MANIFEST, {"dataset_id": dataset_id})
