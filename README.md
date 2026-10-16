@@ -111,7 +111,52 @@ curl -sS "http://127.0.0.1:8000/api/v1/investigations/<investigation_id>"
 
 The investigation then reports those claims as `quarantined` by following the approved decision edge. Original run records, evaluation claims, and metric values remain stored unchanged. The local bearer token guards every API `POST`, and the configured approver label is recorded with approval. This is a single-reviewer local gate; do not expose the API publicly without deployment-grade authentication and authorization.
 
-The graph represents a measured run as `ExperimentRun -[:USES_MODEL_CONFIGURATION]-> ModelConfiguration`, `ExperimentRun -[:HAS_EVALUATION]-> EvaluationClaim`, and `EvaluationClaim -[:REPORTS]-> MetricClaim`. An `Investigation` establishes a `Finding`; the finding points to exact `LineageEvidence` paths and impacted evaluation claims. `ActionProposal -[:TARGETS]-> EvaluationClaim` records proposed scope, while `ApprovalDecision -[:APPROVES]-> ActionProposal` records explicit approval.
+### Graph model and key Cypher
+
+FalkorDB is authoritative for source/sample lineage, datasets, experiments and measured runs, evaluation claims, investigation evidence, action proposals and approvals, recovery job state, and agent memory. Dataset and model bytes, prediction files, and split manifests live as local artifacts under `artifacts/`; Redis stores only transient worker messages.
+
+The principal lineage edges are `DatasetVersion -[:CONTAINS]-> SampleVersion`, `SampleVersion -[:DERIVED_FROM]-> SampleVersion|SourceRecord`, and `Experiment -[:TRAINS_ON|TESTS_ON]-> DatasetVersion`. Runs connect to their consumed training/evaluation datasets and model configuration. A measured run links through `HAS_EVALUATION` to an `EvaluationClaim`, which links through `REPORTS` to `MetricClaim`. An `Investigation` establishes a `Finding`; the finding links to `LineageEvidence` and impacted claims. `ActionProposal -[:TARGETS]-> EvaluationClaim` records scope, `ApprovalDecision -[:APPROVES]-> ActionProposal` records explicit approval, and `AgentSession -[:REMEMBERS]-> AgentMemory -[:REFERS_TO]-> Investigation` supports cross-session verification.
+
+The production queries are allowlisted templates in `apps/api/benchwitness_api/graph_lineage.py`. The sample-level audit joins canonical source IDs along bounded derivation paths, rather than inferring contamination from shared dataset names:
+
+```cypher
+MATCH (experiment:Experiment {id: $experiment_id})-[:TRAINS_ON]->(training:DatasetVersion)
+MATCH (experiment)-[:TESTS_ON]->(evaluation:DatasetVersion)
+MATCH (training)-[:CONTAINS]->(training_sample:SampleVersion)
+MATCH training_path = (training_sample)-[:DERIVED_FROM*1..3]->(source:SourceRecord)
+MATCH (evaluation)-[:CONTAINS]->(evaluation_sample:SampleVersion)
+MATCH evaluation_path = (evaluation_sample)-[:DERIVED_FROM*1..3]->(evaluation_source:SourceRecord)
+WHERE source.id = evaluation_source.id
+RETURN source.id, training.id, training_sample.id, length(training_path),
+       evaluation.id, evaluation_sample.id, length(evaluation_path)
+LIMIT $limit
+```
+
+Impact discovery starts from the canonical record, follows derived sample memberships to the exact consumed dataset, then returns affected run IDs. The implementation runs both a source-family candidate query and this lineage traversal so a stale family label cannot hide recorded ancestry:
+
+```cypher
+MATCH (source:SourceRecord {id: $source_record_id})
+MATCH (sample:SampleVersion)-[:DERIVED_FROM*1..3]->(source)
+MATCH (dataset:DatasetVersion)-[:CONTAINS]->(sample)
+MATCH (run:ExperimentRun)-[:TRAINED_ON]->(training:DatasetVersion)
+MATCH (run)-[:EVALUATED_ON]->(evaluation:DatasetVersion)
+WHERE dataset.id = training.id OR dataset.id = evaluation.id
+RETURN DISTINCT run.id, run.experiment_id, training.id, evaluation.id
+LIMIT $limit
+```
+
+The investigation then traverses from its finding to dependent evaluation and metric claims. All request values are bound parameters; query templates cap derivation depth, row counts, and execution time. The API does not accept user-authored Cypher.
+
+```cypher
+MATCH (investigation:Investigation {id: $investigation_id})-[:ESTABLISHED]->
+      (finding:Finding)-[:IMPACTS]->(claim:EvaluationClaim)
+MATCH (run:ExperimentRun)-[:HAS_EVALUATION]->(claim)
+MATCH (run)-[:USES_MODEL_CONFIGURATION]->(model:ModelConfiguration)
+MATCH (claim)-[:REPORTS]->(metric:MetricClaim)
+RETURN run.id, run.experiment_id, model.id, claim.id, metric.id,
+       metric.metric_name, metric.value
+LIMIT $limit
+```
 
 ## Approve and run clean recovery
 
@@ -175,6 +220,14 @@ npm run build --prefix apps/web
 
 `uv run pytest -m "not integration"` runs API and deterministic fixture tests when the graph is unavailable; it does **not** satisfy the real-graph integration gate. Stop local services with `docker compose down` when finished.
 
+To verify the setup from new, isolated Docker volumes (without touching the normal `benchwitness` containers or graph), run:
+
+```sh
+./scripts/verify_fresh_start.sh
+```
+
+The script binds an isolated Compose project to `127.0.0.1:16379` and `127.0.0.1:16380`, seeds and measures the demo, restarts FalkorDB to verify persisted lineage, then runs the integration suite and quality checks. It stops its containers but keeps its uniquely named FalkorDB volume for inspection. Set `BENCHWITNESS_FRESH_FALKORDB_BIND_PORT` and `BENCHWITNESS_FRESH_REDIS_BIND_PORT` if those ports are occupied; these names avoid accidentally inheriting the standard development ports from a sourced `.env`. The script prints the exact volume name and a command to remove that isolated test volume when you choose.
+
 ## Milestone boundary
 
-Milestone 7 is implemented for the fixed local synthetic scenario. Lineage overlap is not itself a measured score impact; a clean refit may produce the same score. Milestone 8 covers fresh-start verification, demo video, and submission after human review. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) describe later work; they are not evidence that those features exist. AI-assisted implementation must be disclosed in the final submission.
+Milestones 1–7 are implemented. Milestone 8's local fresh-volume, persistence, and quality checks have passed; the remaining release steps are human review, recording/reviewing the demo video, and submitting it with the selected track. Lineage overlap is not itself a measured score impact; a clean refit may produce the same score. Review [AI assistance disclosure](docs/AI_ASSISTANCE_DISCLOSURE.md), [demo script](docs/DEMO_SCRIPT.md), and [submission checklist](docs/SUBMISSION_CHECKLIST.md) before submitting. The [blueprint](PROJECT_BLUEPRINT.md), [strategy](PRE_EVENT_STRATEGY.md), [dataset inventory](DATASET_INVENTORY.md), and [phase plan](DEVELOPMENT_AND_GIT_PLAN.md) provide background.

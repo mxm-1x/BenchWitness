@@ -1,6 +1,6 @@
 # BenchWitness — phase and GitHub delivery plan
 
-**Live delivery plan, updated 16 October 2026.** Milestones 1–6 are complete. Milestone 7 implementation and verification are at the review gate. This plan complements [PROJECT_BLUEPRINT.md](PROJECT_BLUEPRINT.md), [PRE_EVENT_STRATEGY.md](PRE_EVENT_STRATEGY.md), and the first [kickoff prompt](CODEX_KICKOFF_PROMPT.md).
+**Live delivery plan, updated 16 October 2026.** Milestones 1–7 are complete. Milestone 8 fresh-volume verification and release materials are complete locally; the demo recording, human review, and external submission remain. This plan complements [PROJECT_BLUEPRINT.md](PROJECT_BLUEPRINT.md), [PRE_EVENT_STRATEGY.md](PRE_EVENT_STRATEGY.md), and the first [kickoff prompt](CODEX_KICKOFF_PROMPT.md).
 
 The data inputs and controls for Phases 2–5 are listed in [DATASET_INVENTORY.md](DATASET_INVENTORY.md).
 
@@ -35,7 +35,7 @@ Every gate means: run checks, review the diff, commit, push, verify the GitHub S
 | 5. Clean recovery | Oct 16–17 | Separate Redis-backed job; clean split reconstruction; refit and re-evaluation; appended model/evaluation versions | Approved job reaches a measured outcome; duplicate request is idempotent; failure is visible; old versions remain queryable | `feat(worker): run approved clean re-evaluation` |
 | 6. Agent and memory | Oct 17 | Typed, bounded graph tools; graph-driven tool selection; verified investigation memory across sessions | A fresh session retrieves prior evidence and changes its next action when relevant; stale memory triggers verification | `feat(agent): investigate with bounded graph tools`; `feat(memory): recall verified findings across sessions` |
 | 7. Investigation UI | Oct 17 | Opensource UI product shell; real experiment list; bounded Cytoscape evidence path; impact, approval, job progress, before/after | Judge finishes full workflow in UI; no fake values; keyboard and failure-state checks; UI matches API | `feat(web): show evidence and recovery workflow` |
-| 8. Release and submission | Oct 18 | Fresh-volume end-to-end test; README, graph model, key Cypher, setup/seed commands, AI disclosure, video, public submission | Complete local setup works from blank volumes; demo video shows actual outputs; public repo and submission links verified before 23:59 IST | `test: cover full seeded investigation and repair`; `docs: publish reproducible demo and submission` |
+| 8. Release and submission | Oct 18 | Isolated fresh-volume verification script; restart persistence; README graph model and key Cypher; AI disclosure; demo recording guide; submission checklist | Fresh-volume setup, integration, lint/type/build, and persistence checks pass; human records/reviews video and submits the public repo before 23:59 IST | `test: verify fresh local stack and persistence`; `docs: prepare reproducible demo and submission` |
 
 These are target slices, not a license to move to the next milestone automatically. If schedule slips, preserve graph-backed evidence, measured rerun, approval, memory, and a usable UI; cut extra algorithms, broad import, optional local model, and visual polish.
 
