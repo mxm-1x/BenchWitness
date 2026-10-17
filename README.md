@@ -21,6 +21,40 @@ BenchWitness audits ML evaluation integrity using a FalkorDB evidence graph. Mil
 - macOS on Apple Silicon, Python 3.12 through `uv`, Node.js 20.19 or newer, npm, and a working Docker Compose daemon.
 - No paid API, cloud account, or external runtime service. FalkorDB and the job broker are separate local containers.
 
+## Quick start: run the local demo
+
+First complete the one-time installation in [Install and start on macOS](#install-and-start-on-macos), including `docker compose up -d`. Then start these processes in separate terminals from the repository root. In each terminal, load `.env` before starting a process:
+
+**Terminal 1 — API**
+
+```sh
+set -a
+source .env
+set +a
+uv run uvicorn benchwitness_api.main:app --host 127.0.0.1 --port 8000
+```
+
+**Terminal 2 — recovery worker**
+
+```sh
+set -a
+source .env
+set +a
+uv run benchwitness-worker
+```
+
+**Terminal 3 — web app**
+
+```sh
+npm run dev --prefix apps/site -- --hostname 127.0.0.1 --port 3000
+```
+
+Open <http://127.0.0.1:3000>, launch the workspace, and paste the local `BENCHWITNESS_API_TOKEN` from `.env`. If the graph has no demo data, click **Seed graph** and then **Run baseline evaluations** on the Overview tab. Seeding is idempotent; each baseline evaluation run appends three measured run versions, so skip it when runs are already present. Open **Experiment Ledger** to inspect the confirmed, clean-control, and unknown-lineage cases. The [browser workflow](#run-the-browser-workflow) describes the investigation, approved recovery, and memory steps.
+
+### Data used by the demo
+
+The repository does not contain a downloaded or precomputed dataset file. The checked-in generator creates the complete 400-row synthetic dataset and its split and lineage manifests locally; run `uv run benchwitness-seed-demo` or click **Seed graph** in the workspace. Generated files go under `artifacts/demo/scenarios/synthetic-memorization-v2/`, which Git ignores. The generator and its fixed seed are in the repository, so a clean clone can reproduce the demo without a download, dataset API key, or external data service. Dataset composition and integrity checks are described in [Seed and audit the lineage demo](#seed-and-audit-the-lineage-demo) and [DATASET_INVENTORY.md](DATASET_INVENTORY.md).
+
 ## Install and start on macOS
 
 Run from the repository root:
